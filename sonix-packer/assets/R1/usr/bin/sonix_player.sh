@@ -13,6 +13,14 @@ killall -9 batd    &>/dev/null
 fi
 
 #/usr/bin/sonix_player &>/dev/null
+# SD card remount in the case of cold boot issues
+if [ ! -b /dev/mmcblk0 ] && [ ! -b /dev/mmcblk1 ]; then
+    echo "md_ingenic,mmc.1" > /sys/bus/platform/drivers/md_ingenic,mmc/unbind 2>/dev/null
+    sleep 0.5
+    echo "md_ingenic,mmc.1" > /sys/bus/platform/drivers/md_ingenic,mmc/bind 2>/dev/null
+    sleep 0.5
+    mdev -s
+fi
 /usr/bin/sonix_player
 sleep 1
 reboot

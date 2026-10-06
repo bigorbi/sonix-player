@@ -24,6 +24,7 @@
 
 #include "src/system/bluetooth/airpods.h"
 #include "src/system/audio/audio.h"
+#include "src/system/bluetooth/btlog.h"
 #include "src/system/bluetooth/btreceiver.h"
 #include "src/system/bluetooth/btstack.h"
 #include "src/system/bluetooth/btvolume.h"
@@ -114,6 +115,7 @@ typedef enum {
 	JOB_FORGET,
 	JOB_CODECS,		  // re-read what the connected sink offers
 	JOB_LDAC_QUALITY, // restart bluealsa so it reads the new --ldac-quality
+	JOB_RECEIVER_PROFILE, // restart bluealsa with or without the A2DP sink
 	JOB_DISCOVERABLE, // arg_int: 1 visible to everyone, 0 not
 	// The name the adapter answers with. Carried in g_local_name rather than in
 	// the job: a name is longer than `text` holds.
@@ -170,6 +172,10 @@ static bool g_volume_sync;	  // the player's volume drives the headphones'
 static bool g_a2dp_connected; // a bluealsa PCM exists: the only truthful source
 static unsigned g_output_generation; // see bluetooth_output_generation()
 static bool g_bluealsa_restarted;	 // worker only: the next sink is a new daemon's
+
+// Whether bluealsa carries the A2DP sink endpoints: only while the receiver page
+// is open. Under `lock`.
+static bool g_receiver_profile;
 static char g_a2dp_mac[BT_MAC_MAX];
 // The rate the stream to the headphones runs at, as bluealsa last said; 0 when
 // it has not. Read by the worker, which owns the D-Bus connection, so that the
@@ -402,9 +408,11 @@ static bool stop_process(const char *name) {
 // this process's children: the player must never have to reap a daemon it is
 // not watching, and a daemon must never die because the player restarted.
 //
-// stdout and stderr are deliberately inherited -- that is how bluetoothd's and
-// bluealsa's own complaints reach the player's log, which is the only place
-// anybody ever reads them from on this device.
+// stdout and stderr are deliberately inherited -- that is how bluealsa's own
+// complaints, and anything else a daemon prints, reach the player's log, which
+// is the only place anybody ever reads them from on this device. bluetoothd
+// prints nothing there: it writes to syslog, which only the Bluetooth log
+// (btlog.h) listens to.
 static bool spawn_daemon(const char *path, char *const argv[]) {
 	pid_t pid = fork();
 	if (pid < 0) {
@@ -430,6 +438,14 @@ static bool spawn_daemon(const char *path, char *const argv[]) {
 		// only reaping the middle process, which exits immediately
 	}
 	return true;
+}
+
+// bluez reads SIGUSR2 as "turn every debug line on", for good: there is no
+// signal that turns them off again, so the next bluetoothd started without -d
+// is what does.
+void bluetooth_daemon_debug_on(void) {
+	int sig = SIGUSR2;
+	for_each_process("bluetoothd", send_signal, &sig);
 }
 
 // The one place a helper is still run and waited for. Only ever with a fixed
@@ -824,7 +840,17 @@ static bool ensure_bluetoothd(void) {
 	if (!process_running("bluetoothd")) {
 		// -E is the experimental interface and -C the SDP compatibility one. Both
 		// are what the firmware starts it with.
-		char *argv[4] = {(char *)"bluetoothd", (char *)"-E", (char *)"-C", NULL};
+		//
+		// -d only with the Bluetooth log on (btlog.h): every debug line of
+		// bluez, from the profile state machine to the AVDTP negotiation. What
+		// bluetoothd says reaches that log through syslog, which it always
+		// writes to and the log listens on -- so nothing changes about where
+		// its output goes, and with the log off it goes nowhere, as on the
+		// firmware.
+		char *argv[5] = {(char *)"bluetoothd", (char *)"-E", (char *)"-C", NULL, NULL};
+		if (btlog_enabled()) {
+			argv[3] = (char *)"-d";
+		}
 		spawn_daemon(BLUETOOTHD_BIN, argv);
 	}
 
@@ -1038,6 +1064,41 @@ static int codecs_to_ask_for(char out[][BT_CODEC_MAX], int max) {
 	return count;
 }
 
+static bool receiver_profile_wanted(void) {
+	pthread_mutex_lock(&lock);
+	bool wanted = g_receiver_profile;
+	pthread_mutex_unlock(&lock);
+	return wanted;
+}
+
+static void sink_in_cmdline(pid_t pid, void *user) {
+	char path[64];
+	snprintf(path, sizeof(path), "/proc/%d/cmdline", (int)pid);
+	char args[1024];
+	FILE *f = fopen(path, "rb");
+	if (!f) {
+		return;
+	}
+	size_t got = fread(args, 1, sizeof(args) - 1, f);
+	fclose(f);
+	args[got] = '\0';
+	// The arguments are separated by NULs.
+	for (size_t at = 0; at < got; at += strlen(args + at) + 1) {
+		if (strcmp(args + at, "a2dp-sink") == 0) {
+			*(bool *)user = true;
+			return;
+		}
+	}
+}
+
+// Whether the running bluealsa was started with the A2DP sink, read from its
+// command line.
+static bool bluealsa_has_sink(void) {
+	bool sink = false;
+	for_each_process("bluealsa", sink_in_cmdline, &sink);
+	return sink;
+}
+
 static bool ensure_bluealsa(void) {
 	// Before the daemon, not after: the help text comes from running the binary
 	// with -h, not from the bus, and the -c arguments below are built out of it.
@@ -1047,18 +1108,30 @@ static bool ensure_bluealsa(void) {
 		read_local_codecs();
 	}
 
+	// A daemon left from before -- the stock bring-up, or a run of this player
+	// with the receiver open -- may carry the other set of profiles.
+	bool want_sink = receiver_profile_wanted();
+	if (process_running("bluealsa") && bluealsa_has_sink() != want_sink) {
+		fprintf(stderr, "bluetooth: bluealsa is running %s the A2DP sink; starting it again\n",
+				want_sink ? "without" : "with");
+		stop_process("bluealsa");
+		sleep_ms(300);
+	}
+
 	if (!process_running("bluealsa")) {
-		// Both halves of A2DP.
+		// The source half of A2DP always, the sink half only while the receiver
+		// page is open, as on the stock firmware.
 		//
 		// As a source the stream is encoded here and the level goes to the
-		// headphones over AVRCP. As a sink the player is the one being driven: a
-		// phone or a computer encodes, this device decodes and puts the result out
-		// of its own DAC, which is Bluetooth receiver mode. The sink profile has
-		// to be declared here because bluez builds the local SDP record out of the
-		// endpoints bluealsa registers: with only a source endpoint, another
-		// source -- a MacBook, say -- finds no profile in common and
-		// Device1.Connect() fails. Declaring both costs nothing while nothing is
-		// connected: an endpoint no link uses is a record in SDP, not a thread.
+		// headphones over AVRCP. As a sink a phone or a computer encodes and this
+		// device decodes, which is Bluetooth receiver mode.
+		//
+		// bluez builds the local SDP record and the class of device out of the
+		// endpoints bluealsa registers. With the sink endpoints the class says
+		// "Rendering" and the record lists an Audio Sink, and some speakers (an
+		// LG FJ5) then refuse the A2DP channel from this device with "security
+		// block". Without them a MacBook finds no profile in common and cannot
+		// stream here, which only matters with the receiver open.
 		//
 		// --keep-alive holds the A2DP transport for a few seconds after the last
 		// PCM client closes, instead of releasing it at once. It is off by default
@@ -1128,13 +1201,16 @@ static bool ensure_bluealsa(void) {
 		char codecs[BT_MAX_CODECS][BT_CODEC_MAX];
 		int codec_count = codecs_to_ask_for(codecs, BT_MAX_CODECS);
 
-		char *argv[10 + BT_MAX_CODECS * 2];
+		char *argv[11 + BT_MAX_CODECS * 2];
 		int at = 0;
 		argv[at++] = (char *)"bluealsa";
 		argv[at++] = (char *)"-p";
 		argv[at++] = (char *)"a2dp-source";
-		argv[at++] = (char *)"-p";
-		argv[at++] = (char *)"a2dp-sink";
+		if (want_sink) {
+			argv[at++] = (char *)"-p";
+			argv[at++] = (char *)"a2dp-sink";
+		}
+		fprintf(stderr, "bluetooth: bluealsa with the A2DP source%s\n", want_sink ? " and sink" : " only");
 		argv[at++] = (char *)"--a2dp-volume";
 		argv[at++] = keepalive;
 		if (rt) {
@@ -1146,6 +1222,12 @@ static bool ensure_bluealsa(void) {
 		for (int i = 0; i < codec_count; i++) {
 			argv[at++] = (char *)"-c";
 			argv[at++] = codecs[i];
+		}
+		// With the Bluetooth log on, bluealsa's complaints go to syslog so they
+		// land in that log, stamped and in order with bluez's; otherwise they
+		// stay on stderr, which is the player's log.
+		if (btlog_enabled() && bluealsa_knows_option("--syslog")) {
+			argv[at++] = (char *)"--syslog";
 		}
 		argv[at] = NULL;
 		if (codec_count) {
@@ -1627,6 +1709,15 @@ static void forget_last_device(const char *mac) {
 // of the bring-up, before anything is asked of them.
 #define SELF_RECONNECT_GRACE_MS 8000
 
+// Whether Bluetooth is still meant to be on: a wait that took seconds may have
+// been overtaken by the switch.
+static bool bluetooth_still_wanted(void) {
+	pthread_mutex_lock(&lock);
+	bool wanted = g_enabled;
+	pthread_mutex_unlock(&lock);
+	return wanted;
+}
+
 // Waits for the bluealsa PCM of this device to exist, or for the deadline.
 static bool wait_for_a2dp(const char *mac, int timeout_ms) {
 	for (int waited = 0;; waited += 100) {
@@ -1634,10 +1725,7 @@ static bool wait_for_a2dp(const char *mac, int timeout_ms) {
 		if (btstack_audio_sink(sink, sizeof(sink)) && strcasecmp(sink, mac) == 0) {
 			return true;
 		}
-		pthread_mutex_lock(&lock);
-		bool abandon = !g_enabled;
-		pthread_mutex_unlock(&lock);
-		if (abandon || waited >= timeout_ms) {
+		if (!bluetooth_still_wanted() || waited >= timeout_ms) {
 			return false;
 		}
 		sleep_ms(100);
@@ -1680,6 +1768,64 @@ static bool other_connected_sink(const char *except, char *out, size_t size) {
 #define CONNECT_TIMEOUT_MS 25000
 #define PAIR_TIMEOUT_MS 40000
 
+// How long a device that refused Connect is watched for an audio stream of its
+// own before it is asked again.
+#define REFUSED_SETTLE_MS 2000
+
+// Whether the user has asked for something since the job that is running now:
+// a search, a pairing, a connection, a disconnection, a device forgotten.
+static bool user_job_waiting(void) {
+	bool waiting = false;
+	pthread_mutex_lock(&lock);
+	for (int i = 0; i < queue_count && !waiting; i++) {
+		switch (queue[(queue_head + i) % JOB_QUEUE_LEN].type) {
+		case JOB_SCAN:
+		case JOB_PAIR:
+		case JOB_CONNECT:
+		case JOB_DISCONNECT:
+		case JOB_FORGET:
+			waiting = true;
+			break;
+		default:
+			break;
+		}
+	}
+	pthread_mutex_unlock(&lock);
+	return waiting;
+}
+
+// Whether a second Connect may still go out after a refused one. The same
+// things that stop going back to the last headphones stop it: the receiver
+// on, or a phone streaming to this device -- a Connect while that link is up
+// is what used to knock it off -- the user having moved on to something else,
+// or Bluetooth switched off in the meantime.
+static bool second_connect_allowed(const char *mac) {
+	if (!bluetooth_still_wanted()) {
+		return false;
+	}
+	char other[BT_MAC_MAX];
+	if (btstack_audio_source(other, sizeof(other)) || btreceiver_is_active()) {
+		fprintf(stderr, "bluetooth: something is streaming to this device; not asking %s again\n", mac);
+		return false;
+	}
+	if (user_job_waiting()) {
+		fprintf(stderr, "bluetooth: the user asked for something else; not asking %s again\n", mac);
+		return false;
+	}
+	return true;
+}
+
+// Whether a failed Connect was answered by the device itself, as opposed to the
+// device not being there at all. Only org.bluez.Error.Failed qualifies --
+// NotReady, InProgress, AlreadyConnected and the rest are about this side --
+// and of those, "Host is down" is the page timeout of a device that is switched
+// off or out of range, where asking again only repeats the five seconds. No
+// answer at all (an empty `why`) is a timeout of this side's own and does not
+// qualify either.
+static bool connect_was_refused(const char *why) {
+	return strstr(why, "org.bluez.Error.Failed") != NULL && strstr(why, "Host is down") == NULL;
+}
+
 static bool connect_device(const char *mac) {
 	// Never on top of a link that is already up.
 	//
@@ -1701,7 +1847,28 @@ static bool connect_device(const char *mac) {
 		sleep_ms(400);
 	}
 
-	bool ok = btstack_connect(mac, CONNECT_TIMEOUT_MS);
+	char why[160];
+	bool ok = btstack_connect(mac, CONNECT_TIMEOUT_MS, why, sizeof(why));
+	if (!ok && connect_was_refused(why)) {
+		// Not a speaker that is off or out of range -- that is a page
+		// timeout, "Host is down", five seconds of nothing. This one answered
+		// and the link came up for a moment before bluez gave up on it.
+		//
+		// Some speakers open their own A2DP stream the instant the link is
+		// there, at the same time as bluez opens one towards them; the two
+		// collide, bluez's side loses and answers Connect with a failure,
+		// and the speaker's own stream either carries on or is dropped with
+		// the link a second later. The first is looked for, the second gets
+		// one more Connect, made from scratch once the first has let go.
+		fprintf(stderr, "bluetooth: %s refused the link (%s)\n", mac, why);
+		if (wait_for_a2dp(mac, REFUSED_SETTLE_MS)) {
+			fprintf(stderr, "bluetooth: %s brought its audio up by itself after all\n", mac);
+			ok = true;
+		} else if (second_connect_allowed(mac)) {
+			fprintf(stderr, "bluetooth: asking %s once more\n", mac);
+			ok = btstack_connect(mac, CONNECT_TIMEOUT_MS, why, sizeof(why));
+		}
+	}
 	fprintf(stderr, "bluetooth: connect %s -> %s\n", mac, ok ? "ok" : "FAILED");
 	if (ok) {
 		remember_last_device(mac);
@@ -1843,21 +2010,8 @@ static bool reconnect_should_stop(const char *mac) {
 			someone_else = true;
 		}
 	}
-	bool user_waiting = false;
-	for (int i = 0; i < queue_count && !user_waiting; i++) {
-		switch (queue[(queue_head + i) % JOB_QUEUE_LEN].type) {
-		case JOB_SCAN:
-		case JOB_PAIR:
-		case JOB_CONNECT:
-		case JOB_DISCONNECT:
-		case JOB_FORGET:
-			user_waiting = true;
-			break;
-		default:
-			break;
-		}
-	}
 	pthread_mutex_unlock(&lock);
+	bool user_waiting = user_job_waiting();
 
 	if (off) {
 		return true;
@@ -2659,6 +2813,57 @@ static void post_job(const job_t *job) {
 	}
 }
 
+// Stops bluealsa and starts it again with the current options, then asks the
+// headphones that were playing for their A2DP stream: bluez closes it when
+// bluealsa's endpoints go and keeps only the link, and opens nothing again by
+// itself when the new daemon registers. Some headphones ask for the stream
+// again, others (a WF-1000XM5) wait, and the sound ends up on the jack.
+static void restart_bluealsa(const char *why) {
+	pthread_mutex_lock(&lock);
+	char playing[BT_MAC_MAX];
+	copy_field(playing, sizeof(playing), g_a2dp_connected ? g_a2dp_mac : "", sizeof(g_a2dp_mac));
+	pthread_mutex_unlock(&lock);
+
+	fprintf(stderr, "bluetooth: restarting bluealsa: %s\n", why);
+	g_bluealsa_restarted = playing[0] != '\0';
+	stop_process("bluealsa");
+	sleep_ms(300);
+	codec_auto_done[0] = '\0'; // the new daemon negotiates again
+	if (ensure_bluealsa() && playing[0]) {
+		// Not at once: bluealsa takes its name on the bus first and registers
+		// its endpoints with bluez after, and a connect in between fails
+		// ("Failed": nothing to connect the stream to). A few tries a moment
+		// apart.
+		fprintf(stderr, "bluetooth: asking %s for its A2DP stream again\n", playing);
+		for (int attempt = 0; attempt < 4; attempt++) {
+			sleep_ms(attempt == 0 ? 800 : 1500);
+			if (btstack_connect_a2dp(playing, CONNECT_TIMEOUT_MS)) {
+				break;
+			}
+		}
+	}
+}
+
+// With the receiver just opened: a phone or a computer already linked to this
+// device found no sink here when it connected, so its A2DP stream is asked for
+// now rather than left to the user to reconnect. Headphones are skipped.
+static void invite_sources(void) {
+	btstack_device_t devices[BT_MAX_DEVICES];
+	int count = btstack_devices(devices, BT_MAX_DEVICES);
+	bool waited = false;
+	for (int i = 0; i < count; i++) {
+		if (!devices[i].connected || devices[i].audio_sink) {
+			continue;
+		}
+		if (!waited) {
+			sleep_ms(800); // the new daemon registers its endpoints after its name
+			waited = true;
+		}
+		fprintf(stderr, "bluetooth: asking %s to stream here\n", devices[i].address);
+		btstack_connect_a2dp_source(devices[i].address, CONNECT_TIMEOUT_MS);
+	}
+}
+
 static void *bluetooth_worker(void *arg) {
 	(void)arg;
 	thread_be_background("bluetooth");
@@ -2767,6 +2972,9 @@ static void *bluetooth_worker(void *arg) {
 
 			case JOB_DISCONNECT:
 				name_for(job.mac, name, sizeof(name));
+				// Logged, because in the log a link closed from here and a
+				// speaker dropping the link look exactly the same otherwise.
+				fprintf(stderr, "bluetooth: disconnecting %s (asked for)\n", job.mac);
 				btstack_disconnect(job.mac);
 				sleep_ms(400);
 				refresh_devices();
@@ -2775,6 +2983,7 @@ static void *bluetooth_worker(void *arg) {
 
 			case JOB_FORGET:
 				name_for(job.mac, name, sizeof(name));
+				fprintf(stderr, "bluetooth: forgetting %s\n", job.mac);
 				btstack_disconnect(job.mac);
 				set_op(btstack_remove(job.mac) ? BT_OP_OK : BT_OP_FAILED, name);
 				forget_last_device(job.mac);
@@ -2787,36 +2996,22 @@ static void *bluetooth_worker(void *arg) {
 
 			case JOB_LDAC_QUALITY:
 				if (process_running("bluealsa")) {
-					// The headphones playing now, if any. bluez closes their A2DP
-					// stream when bluealsa's endpoints go and keeps only the link,
-					// and it opens nothing again by itself when the new daemon
-					// registers: some headphones ask for the stream again, others
-					// (a WF-1000XM5) wait, and the sound ends up on the jack.
-					pthread_mutex_lock(&lock);
-					char playing[BT_MAC_MAX];
-					copy_field(playing, sizeof(playing), g_a2dp_connected ? g_a2dp_mac : "", sizeof(g_a2dp_mac));
-					pthread_mutex_unlock(&lock);
+					char why[48];
+					snprintf(why, sizeof(why), "LDAC %s", bluetooth_ldac_quality());
+					restart_bluealsa(why);
+				}
+				break;
 
-					fprintf(stderr, "bluetooth: restarting bluealsa for LDAC %s\n", bluetooth_ldac_quality());
-					g_bluealsa_restarted = playing[0] != '\0';
-					stop_process("bluealsa");
-					sleep_ms(300);
-					codec_auto_done[0] = '\0'; // the new daemon negotiates again
-					if (ensure_bluealsa() && playing[0]) {
-						// Not at once: bluealsa takes its name on the bus first
-						// and registers its endpoints with bluez after, and a
-						// connect in between fails ("Failed": nothing to connect
-						// the stream to). A few tries a moment apart.
-						fprintf(stderr, "bluetooth: asking %s for its A2DP stream again\n", playing);
-						for (int attempt = 0; attempt < 4; attempt++) {
-							sleep_ms(attempt == 0 ? 800 : 1500);
-							if (btstack_connect_a2dp(playing, CONNECT_TIMEOUT_MS)) {
-								break;
-							}
-						}
+			case JOB_RECEIVER_PROFILE: {
+				bool want = receiver_profile_wanted();
+				if (process_running("bluealsa") && bluealsa_has_sink() != want) {
+					restart_bluealsa(want ? "receiver open" : "receiver closed");
+					if (want) {
+						invite_sources();
 					}
 				}
 				break;
+			}
 
 			case JOB_DISCOVERABLE:
 				btstack_set_discoverable(job.arg_int != 0);
@@ -3280,6 +3475,17 @@ void bluetooth_set_ldac_quality(const char *mode) {
 	// worker like everything else that touches the stack.
 	job_t job = {.type = JOB_LDAC_QUALITY};
 	post_job(&job);
+}
+
+void bluetooth_set_receiver_profile(bool on) {
+	pthread_mutex_lock(&lock);
+	bool changed = g_receiver_profile != on;
+	g_receiver_profile = on;
+	pthread_mutex_unlock(&lock);
+	if (changed) {
+		job_t job = {.type = JOB_RECEIVER_PROFILE};
+		post_job(&job);
+	}
 }
 
 void bluetooth_set_codec(const char *codec) {

@@ -7,10 +7,12 @@
 #include <string.h>
 #include <strings.h>
 #include <stdint.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "src/system/audio/audio.h"
+#include "src/system/audio/eq.h"
 #include "src/system/core/config.h"
 #include "src/system/decode/aacdec.h"
 #include "src/system/net/hls.h"
@@ -793,6 +795,9 @@ const char *radio_station_problem(const radio_station_t *station) {
 
 static pthread_mutex_t store_lock = PTHREAD_MUTEX_INITIALIZER;
 static sqlite3 *store;
+// The file the store was opened from, and which file that was.
+static char store_path[512];
+static file_identity_t store_identity;
 
 static const char *const STORE_SCHEMA[] = {
 	"CREATE TABLE IF NOT EXISTS FAVOURITES ("
@@ -865,9 +870,30 @@ bool radio_store_open(const char *sd_root) {
 		store_exec(STORE_SCHEMA[i]);
 	}
 
+	snprintf(store_path, sizeof(store_path), "%s", path);
+	file_identity_read(path, &store_identity);
+
 	printf("radio: %s open\n", path);
 	pthread_mutex_unlock(&store_lock);
 	return true;
+}
+
+void radio_store_reopen_if_replaced(void) {
+	pthread_mutex_lock(&store_lock);
+	bool replaced = store && store_path[0] && file_identity_changed(store_path, &store_identity);
+	pthread_mutex_unlock(&store_lock);
+	if (!replaced || !store_root[0]) {
+		return;
+	}
+
+	printf("radio: %s was deleted or replaced; opening it again\n", store_path);
+	radio_store_close();
+	char dir[sizeof(store_root) + 16];
+	snprintf(dir, sizeof(dir), "%s/.local", store_root);
+	mkdir(dir, 0777);
+	char root[sizeof(store_root)];
+	snprintf(root, sizeof(root), "%s", store_root);
+	radio_store_open(root);
 }
 
 void radio_store_close(void) {
@@ -1056,6 +1082,8 @@ bool radio_recent_get(int index, radio_station_t *out) {
 // ---------------------------------------------------------------------------
 
 static radio_station_t custom[RADIO_CUSTOM_MAX];
+// The heading each station opens, empty for the ones that open none.
+static char custom_heading[RADIO_CUSTOM_MAX][RADIO_NAME_MAX];
 static int custom_count;
 static bool custom_present;
 static pthread_mutex_t custom_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1077,9 +1105,27 @@ static char *trim(char *s) {
 // What a line is.
 typedef enum {
 	CUSTOM_LINE_STATION,
+	CUSTOM_LINE_HEADING, // "[ROCK]": the stations below belong to it
 	CUSTOM_LINE_IGNORED, // blank, or a comment: not something to complain about
 	CUSTOM_LINE_BAD,
 } custom_line_t;
+
+// A heading is a whole line in square brackets with something inside. A
+// station whose name starts with a bracket ("[Live] Radio, http://...") does
+// not end with one, so it stays a station. `heading` receives the text.
+static bool custom_parse_heading(char *text, char *heading, size_t heading_size) {
+	size_t len = strlen(text);
+	if (len < 3 || text[0] != '[' || text[len - 1] != ']') {
+		return false;
+	}
+	text[len - 1] = '\0';
+	char *inside = trim(text + 1);
+	if (!inside[0]) {
+		return false;
+	}
+	snprintf(heading, heading_size, "%s", inside);
+	return true;
+}
 
 // One line into a station.
 //
@@ -1087,10 +1133,13 @@ typedef enum {
 // after it: an address cannot contain a comma before its scheme, and a station
 // called "Radio Uno, Roma" is more likely than one whose URL needs the split to
 // happen later.
-static custom_line_t custom_parse_line(char *line, radio_station_t *out) {
+static custom_line_t custom_parse_line(char *line, radio_station_t *out, char *heading, size_t heading_size) {
 	char *text = trim(line);
 	if (!text[0] || text[0] == '#') {
 		return CUSTOM_LINE_IGNORED;
+	}
+	if (custom_parse_heading(text, heading, heading_size)) {
+		return CUSTOM_LINE_HEADING;
 	}
 
 	char *comma = strchr(text, ',');
@@ -1136,10 +1185,21 @@ void radio_custom_reload(void) {
 
 	char line[RADIO_URL_MAX + RADIO_NAME_MAX + 8];
 	int bad = 0;
+	int headings = 0;
+	// A heading waits for the station under it; two in a row, the second wins,
+	// and one with no station after it shows nothing.
+	char pending[RADIO_NAME_MAX] = "";
 	while (custom_count < RADIO_CUSTOM_MAX && fgets(line, sizeof(line), f)) {
-		switch (custom_parse_line(line, &custom[custom_count])) {
+		char heading[RADIO_NAME_MAX];
+		switch (custom_parse_line(line, &custom[custom_count], heading, sizeof(heading))) {
 		case CUSTOM_LINE_STATION:
+			snprintf(custom_heading[custom_count], sizeof(custom_heading[0]), "%s", pending);
+			pending[0] = '\0';
 			custom_count++;
+			break;
+		case CUSTOM_LINE_HEADING:
+			snprintf(pending, sizeof(pending), "%s", heading);
+			headings++;
 			break;
 		case CUSTOM_LINE_BAD:
 			bad++;
@@ -1152,7 +1212,8 @@ void radio_custom_reload(void) {
 
 	// Only the lines somebody meant as a station and got wrong are counted:
 	// blanks and comments are how the file is meant to be written.
-	fprintf(stderr, "radio: %s -- %d stations, %d unreadable lines\n", path, custom_count, bad);
+	fprintf(stderr, "radio: %s -- %d stations, %d headings, %d unreadable lines\n", path, custom_count, headings,
+			bad);
 	pthread_mutex_unlock(&custom_lock);
 }
 
@@ -1171,6 +1232,20 @@ bool radio_custom_get(int index, radio_station_t *out) {
 	bool ok = index >= 0 && index < custom_count;
 	if (ok) {
 		*out = custom[index];
+	}
+	pthread_mutex_unlock(&custom_lock);
+	return ok;
+}
+
+bool radio_custom_heading(int index, char *out, size_t out_size) {
+	if (!out || out_size == 0) {
+		return false;
+	}
+	out[0] = '\0';
+	pthread_mutex_lock(&custom_lock);
+	bool ok = index >= 0 && index < custom_count && custom_heading[index][0];
+	if (ok) {
+		snprintf(out, out_size, "%s", custom_heading[index]);
 	}
 	pthread_mutex_unlock(&custom_lock);
 	return ok;
@@ -1954,13 +2029,19 @@ static bool radio_push_pcm(radio_out_t *out, short *pcm, short *stereo, int fram
 		pthread_mutex_unlock(&now_lock);
 	}
 
+	// The equaliser, the parametric one and MSEB, on the stereo pair about to
+	// be written -- the same chain a track from the card goes through, and a
+	// no-op when all three are off. A station is not a file, but what the
+	// listener has tuned is for the headphones, not for the source.
 	if (channels == 1) {
 		for (int i = frames - 1; i >= 0; i--) {
 			stereo[2 * i] = pcm[i];
 			stereo[2 * i + 1] = pcm[i];
 		}
+		eq_process(stereo, frames, 2, rate);
 		audio_external_write(stereo, frames);
 	} else if (channels == 2) {
+		eq_process(pcm, frames, 2, rate);
 		audio_external_write(pcm, frames);
 	} else {
 		// More than two channels, which on a radio station is AAC carrying 5.1.
@@ -1978,6 +2059,7 @@ static bool radio_push_pcm(radio_out_t *out, short *pcm, short *stereo, int fram
 			stereo[2 * i] = (short)(left / pairs);
 			stereo[2 * i + 1] = (short)(right / pairs);
 		}
+		eq_process(stereo, frames, 2, rate);
 		audio_external_write(stereo, frames);
 	}
 	return true;

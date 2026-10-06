@@ -57,8 +57,8 @@ static lv_timer_t *pump_timer;
 
 // ---------------------------------------------------------------------------
 
-static void hide(lv_obj_t *obj) { lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN); }
-static void show(lv_obj_t *obj) { lv_obj_remove_flag(obj, LV_OBJ_FLAG_HIDDEN); }
+static void hide(lv_obj_t *obj) { lv_obj_set_hidden(obj, true); }
+static void show(lv_obj_t *obj) { lv_obj_set_hidden(obj, false); }
 
 static bool switch_is_on(void) { return lv_obj_has_state(toggle, LV_STATE_CHECKED); }
 
@@ -747,6 +747,18 @@ static void toggle_changed_cb(lv_event_t *e) {
 	refresh();
 }
 
+// The control centre switched the service with the page open under it: the
+// switch and the lines under it follow, and nothing else is touched.
+static void switched_elsewhere_cb(lv_event_t *e) {
+	(void)e;
+	if (sonixlink_get_enabled()) {
+		lv_obj_add_state(toggle, LV_STATE_CHECKED);
+	} else {
+		lv_obj_remove_state(toggle, LV_STATE_CHECKED);
+	}
+	refresh();
+}
+
 static void screen_loaded_cb(lv_event_t *e) {
 	(void)e;
 
@@ -809,8 +821,8 @@ void sonixlink_page_init(gui_config_t *cfg) {
 	lv_obj_set_flex_flow(links_row, LV_FLEX_FLOW_ROW);
 	lv_obj_set_style_pad_column(links_row, 12, 0);
 	lv_obj_set_style_margin_top(links_row, 16, 0);
-	lv_obj_remove_flag(links_row, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_add_flag(links_row, LV_OBJ_FLAG_EVENT_BUBBLE);
+	lv_obj_set_scrollable(links_row, false);
+	lv_obj_set_event_bubble(links_row, true);
 	lv_obj_t *wifi_half = settingsrow_add(links_row, "wi_fi", NULL, wifi_row_cb, NULL);
 	lv_obj_t *bluetooth_half = settingsrow_add(links_row, "bluetooth", NULL, bluetooth_row_cb, NULL);
 	lv_obj_set_width(wifi_half, 1);
@@ -829,6 +841,7 @@ void sonixlink_page_init(gui_config_t *cfg) {
 	pump_pace();
 
 	lv_obj_add_event_cb(sonixlink_screen, screen_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
+	lv_obj_add_event_cb(sonixlink_screen, switched_elsewhere_cb, LV_EVENT_REFRESH, NULL);
 	lv_obj_add_event_cb(sonixlink_screen, screen_unloaded_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
 
 	refresh();

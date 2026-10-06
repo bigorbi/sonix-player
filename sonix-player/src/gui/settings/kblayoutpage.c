@@ -21,7 +21,8 @@ lv_obj_t *kblayoutpage_screen;
 // two others, and the gap it would leave has to be somewhere a drop can land.
 // Both lists live on the same canvas, one under the other with a heading each,
 // so a row crossing from one to the other is one coordinate and not a change of
-// parent.
+// parent. The page scrolls when the rows do not fit, and by itself while a row
+// is held near its top or bottom edge.
 // ---------------------------------------------------------------------------
 
 #define ROW_HEIGHT 72
@@ -38,12 +39,18 @@ lv_obj_t *kblayoutpage_screen;
 // How far the finger has to travel before a release counts as a drop.
 #define DROP_MIN_TRAVEL 8
 
+// A held row this close to either end of the page scrolls it by EDGE_STEP per
+// input read.
+#define EDGE_PX 70
+#define EDGE_STEP 18
+
 typedef struct {
 	lv_obj_t *row;
 	lv_obj_t *name;
 	lv_obj_t *grip;
 } entry_t;
 
+static lv_obj_t *page;
 static lv_obj_t *body;
 static lv_obj_t *others_heading;
 static entry_t entries[KB_LAYOUT_COUNT];
@@ -93,10 +100,10 @@ static void refresh(void) {
 
 	for (int i = 0; i < KB_LAYOUT_COUNT; i++) {
 		if (i >= row_count) {
-			lv_obj_add_flag(entries[i].row, LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(entries[i].row, true);
 			continue;
 		}
-		lv_obj_remove_flag(entries[i].row, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(entries[i].row, false);
 		lv_label_set_text(entries[i].name, kblayout_name(row_layout[i]));
 
 		// The first of the ones in use is the one every keyboard opens in, and
@@ -153,6 +160,27 @@ static void drop(kblayout_t layout, lv_point_t point) {
 	keyboard_refresh_layout();
 }
 
+static void edge_scroll(lv_point_t point) {
+	lv_area_t view;
+	lv_obj_get_coords(page, &view);
+	int step = 0;
+	if (point.y < view.y1 + EDGE_PX) {
+		step = -EDGE_STEP;
+	} else if (point.y > view.y2 - EDGE_PX) {
+		step = EDGE_STEP;
+	}
+	if (step == 0) {
+		return;
+	}
+	int scroll = lv_obj_get_scroll_y(page);
+	int limit = scroll + lv_obj_get_scroll_bottom(page);
+	int wanted = scroll + step;
+	wanted = wanted < 0 ? 0 : (wanted > limit ? limit : wanted);
+	if (wanted != scroll) {
+		lv_obj_scroll_to_y(page, wanted, LV_ANIM_OFF);
+	}
+}
+
 static void drag_cb(lv_event_t *e) {
 	lv_event_code_t code = lv_event_get_code(e);
 	lv_obj_t *grip = lv_event_get_current_target(e);
@@ -193,7 +221,7 @@ static void drag_cb(lv_event_t *e) {
 		lv_obj_set_style_border_color(drag_ghost, theme()->accent, 0);
 		lv_obj_set_style_shadow_width(drag_ghost, 0, 0);
 		lv_obj_set_style_pad_hor(drag_ghost, 20, 0);
-		lv_obj_remove_flag(drag_ghost, LV_OBJ_FLAG_SCROLLABLE);
+		lv_obj_set_scrollable(drag_ghost, false);
 
 		lv_obj_t *label = lv_label_create(drag_ghost);
 		lv_label_set_text(label, kblayout_name(drag_layout));
@@ -211,6 +239,7 @@ static void drag_cb(lv_event_t *e) {
 	}
 
 	if (code == LV_EVENT_PRESSING) {
+		edge_scroll(point);
 		ghost_follow(point);
 		if (LV_ABS(point.y - drag_from.y) > DROP_MIN_TRAVEL || LV_ABS(point.x - drag_from.x) > DROP_MIN_TRAVEL) {
 			drag_moved = true;
@@ -251,7 +280,7 @@ void kblayoutpage_init(gui_config_t *cfg) {
 	lv_obj_add_style(kblayoutpage_screen, &theme_style_screen, 0);
 
 	lv_obj_t *container = settingsrow_page(kblayoutpage_screen, cfg, "keyboard_layout");
-	lv_obj_remove_flag(container, LV_OBJ_FLAG_SCROLLABLE);
+	page = container;
 
 	int width = cfg->screen_width - 2 * cfg->padding;
 
@@ -261,7 +290,7 @@ void kblayoutpage_init(gui_config_t *cfg) {
 	lv_obj_set_style_bg_opa(body, 0, 0);
 	lv_obj_set_style_border_width(body, 0, 0);
 	lv_obj_set_style_pad_all(body, 0, 0);
-	lv_obj_remove_flag(body, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_set_scrollable(body, false);
 
 	make_heading(body, "in_use", 0);
 	others_heading = make_heading(body, "kblayout_others", 0);
@@ -275,7 +304,7 @@ void kblayoutpage_init(gui_config_t *cfg) {
 		lv_obj_set_style_border_width(row, 0, 0);
 		lv_obj_set_style_shadow_width(row, 0, 0);
 		lv_obj_set_style_pad_hor(row, 20, 0);
-		lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+		lv_obj_set_scrollable(row, false);
 
 		entries[i].row = row;
 
@@ -293,8 +322,11 @@ void kblayoutpage_init(gui_config_t *cfg) {
 		lv_obj_set_style_bg_opa(entries[i].grip, 0, 0);
 		lv_obj_set_style_border_width(entries[i].grip, 0, 0);
 		lv_obj_set_style_pad_all(entries[i].grip, 0, 0);
-		lv_obj_remove_flag(entries[i].grip, LV_OBJ_FLAG_SCROLLABLE);
-		lv_obj_add_flag(entries[i].grip, LV_OBJ_FLAG_CLICKABLE);
+		lv_obj_set_scrollable(entries[i].grip, false);
+		lv_obj_set_clickable(entries[i].grip, true);
+		// A drag that starts on the grip carries the row, not the page.
+		lv_obj_set_scroll_chain_ver(entries[i].grip, false);
+		lv_obj_set_scroll_chain_hor(entries[i].grip, false);
 
 		lv_obj_t *grip_icon = lv_image_create(entries[i].grip);
 		lv_image_set_src(grip_icon, &icon_grip);
@@ -316,9 +348,9 @@ void kblayoutpage_init(gui_config_t *cfg) {
 	lv_obj_set_style_bg_opa(drag_layer, 0, 0);
 	lv_obj_set_style_border_width(drag_layer, 0, 0);
 	lv_obj_set_style_pad_all(drag_layer, 0, 0);
-	lv_obj_remove_flag(drag_layer, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_remove_flag(drag_layer, LV_OBJ_FLAG_CLICKABLE);
-	lv_obj_add_flag(drag_layer, LV_OBJ_FLAG_IGNORE_LAYOUT);
+	lv_obj_set_scrollable(drag_layer, false);
+	lv_obj_set_clickable(drag_layer, false);
+	lv_obj_set_ignore_layout(drag_layer, true);
 
 	lv_obj_add_event_cb(kblayoutpage_screen, loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
 	switcher_attach_back_gesture(kblayoutpage_screen);

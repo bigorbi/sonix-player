@@ -160,6 +160,11 @@ long power_get_max_brightness(void);   // -1 if unknown
 // date picker being the obvious one.
 void power_hold_screen_on(bool hold);
 
+// The same, held by what is on the screen rather than by a job: the lyrics in
+// the player, for as long as they are on show. A flag of its own, so that one
+// of the two letting go does not release the other.
+void power_hold_screen_for_view(bool hold);
+
 // Stops charging once the battery reaches `percent` (80..100; 100 means no
 // limit). Whether this can be enforced depends on the charger driver exposing
 // a control node -- power_charge_limit_supported() says whether it found one.
@@ -179,6 +184,12 @@ bool power_charging_held(void);
 // shutdown, so a device switched off at its charge limit would come back to a
 // cable that does nothing until the next boot resets the chip.
 void power_charging_release(void);
+
+// Switches the device off the whole way: the playing position and the clock
+// saved, the streaming caches emptied, the card's databases closed and the
+// card unmounted, then `poweroff` through init. Does not return. The power
+// menu and the automatic shutdown both end here.
+void power_shutdown(void);
 
 // Forbids or allows charging outright, on top of the percentage limit. Used by
 // DAC mode, where the point of not charging is to keep the charger's noise off

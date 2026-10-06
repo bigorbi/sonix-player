@@ -18,6 +18,7 @@
 #include "src/gui/shell/theme.h"
 #include "src/gui/nowplaying/cover.h"
 #include "src/system/audio/audio.h"
+#include "src/system/audio/replaygain.h"
 #include "src/system/decode/decode.h"
 #include "src/system/library/metadata.h"
 #include "src/system/playback/device_state.h"
@@ -137,13 +138,13 @@ static void queue_row_bind(queue_row_t *row, int index) {
 	row->index = index;
 
 	if (index < 0 || index >= queue_total) {
-		lv_obj_add_flag(row->button, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(row->button, true);
 		return;
 	}
 
 	char path[512];
 	if (!playlist_path_at(index, path, sizeof(path))) {
-		lv_obj_add_flag(row->button, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(row->button, true);
 		return;
 	}
 
@@ -167,7 +168,7 @@ static void queue_row_bind(queue_row_t *row, int index) {
 		}
 	}
 
-	lv_obj_remove_flag(row->button, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(row->button, false);
 	lv_obj_set_y(row->button, index * QUEUE_ROW_PITCH);
 	lv_label_set_text(row->label, title);
 
@@ -234,9 +235,9 @@ static void queue_rebuild(void) {
 	queue_window_update();
 
 	if (queue_total == 0) {
-		lv_obj_remove_flag(queue_empty, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(queue_empty, false);
 	} else {
-		lv_obj_add_flag(queue_empty, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(queue_empty, true);
 	}
 }
 
@@ -271,8 +272,8 @@ static void build_queue_page(gui_config_t *cfg) {
 	lv_obj_set_style_bg_opa(queue_body, 0, 0);
 	lv_obj_set_style_border_width(queue_body, 0, 0);
 	lv_obj_set_style_pad_all(queue_body, 0, 0);
-	lv_obj_remove_flag(queue_body, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_add_flag(queue_body, LV_OBJ_FLAG_EVENT_BUBBLE);
+	lv_obj_set_scrollable(queue_body, false);
+	lv_obj_set_event_bubble(queue_body, true);
 
 	queue_empty = lv_label_create(queue_list);
 	lv_label_set_text(queue_empty, tr("trackmenu_queue_empty"));
@@ -280,7 +281,7 @@ static void build_queue_page(gui_config_t *cfg) {
 	lv_obj_add_style(queue_empty, &theme_style_text_dim, 0);
 	lv_obj_set_style_text_font(queue_empty, &font_ui_24, 0);
 	lv_obj_align(queue_empty, LV_ALIGN_TOP_MID, 0, 120);
-	lv_obj_add_flag(queue_empty, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(queue_empty, true);
 
 	for (int i = 0; i < QUEUE_ROW_POOL; i++) {
 		queue_row_t *row = &queue_rows[i];
@@ -295,8 +296,8 @@ static void build_queue_page(gui_config_t *cfg) {
 		lv_obj_set_style_shadow_width(row->button, 0, 0);
 		lv_obj_set_style_pad_all(row->button, 8, 0);
 		lv_obj_set_style_pad_column(row->button, 14, 0);
-		lv_obj_add_flag(row->button, LV_OBJ_FLAG_HIDDEN);
-		lv_obj_add_flag(row->button, LV_OBJ_FLAG_EVENT_BUBBLE);
+		lv_obj_set_hidden(row->button, true);
+		lv_obj_set_event_bubble(row->button, true);
 		lv_obj_add_event_cb(row->button, queue_row_clicked_cb, LV_EVENT_CLICKED, NULL);
 		lv_obj_set_flex_flow(row->button, LV_FLEX_FLOW_ROW);
 		lv_obj_set_flex_align(row->button, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -337,10 +338,10 @@ static void details_add_row(const char *name, const char *value) {
 	lv_obj_set_style_border_width(row, 0, 0);
 	lv_obj_set_style_pad_all(row, 0, 0);
 	lv_obj_set_style_pad_gap(row, 2, 0);
-	lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_set_scrollable(row, false);
 	// Presses over the text must climb to the scroll surface, or the swipe
 	// gestures can never start on the card's content.
-	lv_obj_add_flag(row, LV_OBJ_FLAG_EVENT_BUBBLE);
+	lv_obj_set_event_bubble(row, true);
 	lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
 
 	lv_obj_t *name_label = lv_label_create(row);
@@ -367,8 +368,23 @@ static char details_path[512];
 // none; `lossy` says the format discards information. See decode.h: for a lossy
 // file the bit/kHz pair describes the PCM leaving the decoder, not what was
 // encoded.
+// One ReplayGain figure from the tags: the correction, and the peak it was
+// measured against when the file gives one.
+static void details_add_gain(const char *name, float gain_db, float peak) {
+	char buffer[64];
+	if (peak > 0) {
+		snprintf(buffer, sizeof(buffer), tr("trackmenu_rg_gain_peak"), gain_db, peak);
+	} else {
+		snprintf(buffer, sizeof(buffer), "%+.2f dB", gain_db);
+	}
+	details_add_row(name, buffer);
+}
+
+// `playing` adds what the player is applying to this file right now, which
+// only exists for the track being played.
 static void details_fill(const char *file, const song_metadata_t *tags, int bits, double sample_rate,
-						 int channels, double duration_secs, const char *codec, int kbps, bool lossy) {
+						 int channels, double duration_secs, const char *codec, int kbps, bool lossy,
+						 bool playing) {
 	char buffer[64];
 
 	const char *slash = strrchr(file, '/');
@@ -421,6 +437,23 @@ static void details_fill(const char *file, const song_metadata_t *tags, int bits
 			int avg = (int)((double)st_kbps.st_size * 8.0 / duration_secs / 1000.0 + 0.5);
 			snprintf(buffer, sizeof(buffer), "%d kbps", avg);
 			details_add_row("trackmenu_bitrate", buffer);
+		}
+	}
+
+	if (tags->has_track_gain) {
+		details_add_gain("trackmenu_rg_track", tags->track_gain_db, tags->track_peak);
+	}
+	if (tags->has_album_gain) {
+		details_add_gain("trackmenu_rg_album", tags->album_gain_db, tags->album_peak);
+	}
+	// The applied figure can differ from both tags: it is the one the mode
+	// picks, lowered when the peak would clip, and capped at +12 dB.
+	if (playing && (tags->has_track_gain || tags->has_album_gain)) {
+		if (replaygain_mode() == REPLAYGAIN_OFF) {
+			details_add_row("trackmenu_rg_applied", tr("trackmenu_rg_off"));
+		} else {
+			snprintf(buffer, sizeof(buffer), "%+.2f dB", replaygain_current_db());
+			details_add_row("trackmenu_rg_applied", buffer);
 		}
 	}
 
@@ -486,7 +519,8 @@ static void details_rebuild(void) {
 			}
 		}
 
-		details_fill(details_path, &tags, bits, sample_rate, channels, duration_secs, codec, kbps, lossy);
+		details_fill(details_path, &tags, bits, sample_rate, channels, duration_secs, codec, kbps, lossy,
+					 false);
 		return;
 	}
 
@@ -516,7 +550,7 @@ static void details_rebuild(void) {
 	}
 
 	details_fill(state.current_file, &state.metadata, audio_get_stream_bits(), state.stream_sample_rate,
-				 state.stream_channels, state.progress_total_secs, codec, kbps, lossy);
+				 state.stream_channels, state.progress_total_secs, codec, kbps, lossy, true);
 }
 
 static void details_loaded_cb(lv_event_t *e) {
@@ -561,8 +595,8 @@ static void build_details_page(gui_config_t *cfg) {
 	lv_obj_set_style_shadow_width(details_card, 0, 0);
 	lv_obj_set_style_pad_all(details_card, 18, 0);
 	lv_obj_set_style_pad_gap(details_card, 14, 0);
-	lv_obj_remove_flag(details_card, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_add_flag(details_card, LV_OBJ_FLAG_EVENT_BUBBLE);
+	lv_obj_set_scrollable(details_card, false);
+	lv_obj_set_event_bubble(details_card, true);
 	lv_obj_set_flex_flow(details_card, LV_FLEX_FLOW_COLUMN);
 
 	// Deliberately not player_sheet_attach_drag(): this page is opened from the

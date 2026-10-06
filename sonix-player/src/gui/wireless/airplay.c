@@ -40,8 +40,8 @@ static lv_timer_t *poll_timer;
 
 // ---------------------------------------------------------------------------
 
-static void hide(lv_obj_t *obj) { lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN); }
-static void show(lv_obj_t *obj) { lv_obj_remove_flag(obj, LV_OBJ_FLAG_HIDDEN); }
+static void hide(lv_obj_t *obj) { lv_obj_set_hidden(obj, true); }
+static void show(lv_obj_t *obj) { lv_obj_set_hidden(obj, false); }
 
 static bool switch_is_on(void) { return lv_obj_has_state(toggle, LV_STATE_CHECKED); }
 
@@ -185,6 +185,18 @@ static void toggle_changed_cb(lv_event_t *e) {
 	set_receiver(on);
 }
 
+// The control centre switched the service with the page open under it: the
+// switch and the lines under it follow, and nothing else is touched.
+static void switched_elsewhere_cb(lv_event_t *e) {
+	(void)e;
+	if (airplay_get_enabled() && airplay_available()) {
+		lv_obj_add_state(toggle, LV_STATE_CHECKED);
+	} else {
+		lv_obj_remove_state(toggle, LV_STATE_CHECKED);
+	}
+	refresh();
+}
+
 static void screen_loaded_cb(lv_event_t *e) {
 	(void)e;
 
@@ -277,6 +289,7 @@ void airplay_page_init(gui_config_t *cfg) {
 	lv_timer_pause(poll_timer);
 
 	lv_obj_add_event_cb(airplay_screen, screen_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
+	lv_obj_add_event_cb(airplay_screen, switched_elsewhere_cb, LV_EVENT_REFRESH, NULL);
 	lv_obj_add_event_cb(airplay_screen, screen_unloaded_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
 
 	refresh();

@@ -30,8 +30,9 @@
 #define SCAN_MAX_ENTRIES 4096
 
 // PRAGMA user_version of an index whose rows carry authors, series, folder
-// books and summaries. Anything lower was written by an older scan.
-#define SCHEMA_VERSION 3
+// books of any format and summaries. Anything lower was written by an older
+// scan.
+#define SCHEMA_VERSION 4
 
 // Bookmarks kept per book at most; a mark this close to another one in the
 // same file replaces it rather than standing beside it.
@@ -40,6 +41,10 @@
 
 static sqlite3 *db;
 static pthread_mutex_t db_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// The file the index was opened from, and which file that was.
+static char db_file[512];
+static file_identity_t db_identity;
 
 // Bumped whenever the row ids of AUDIOBOOK_TABLE may have moved: a scan empties
 // and refills it, a different card is a different set of books, and marking one
@@ -179,7 +184,30 @@ bool audiobookdb_open(const char *db_path) {
 	__atomic_add_fetch(&card_epoch, 1, __ATOMIC_RELEASE);
 	pthread_mutex_unlock(&db_lock);
 
+	snprintf(db_file, sizeof(db_file), "%s", db_path);
+	file_identity_read(db_path, &db_identity);
+
 	printf("audiobooks: %s open, %d books indexed%s\n", db_path, books, outdated ? " (an older scan)" : "");
+	return true;
+}
+
+bool audiobookdb_reopen_if_replaced(void) {
+	if (!db || !db_file[0] || !file_identity_changed(db_file, &db_identity)) {
+		return false;
+	}
+
+	char path[sizeof(db_file)];
+	snprintf(path, sizeof(path), "%s", db_file);
+	printf("audiobooks: %s was deleted or replaced; opening it again\n", path);
+
+	audiobookdb_close();
+	char *slash = strrchr(path, '/');
+	if (slash) {
+		*slash = '\0';
+		mkdir(path, 0777);
+		*slash = '/';
+	}
+	audiobookdb_open(path);
 	return true;
 }
 
@@ -1011,8 +1039,8 @@ int audiobookdb_bookmarked_books_for_each(audiobook_bookmarked_book_cb cb, void 
 // its subfolders are walked, so one directory is open at a time whatever the
 // depth. In each folder:
 //
-//   an .m4b, or an .m4a, .mp3, .opus, .ogg or .flac with chapter marks, is a
-//   book of its own;
+//   a file with chapter marks inside it (.m4b, .m4a, .mp4, .mp3, .opus, .ogg,
+//   .flac) is a book of its own;
 //
 //   the other audio files, together with those of its "CD 1" / "Disc 2"
 //   subfolders, are grouped by album tag: a group of two or more is a folder
@@ -1149,7 +1177,7 @@ static bool is_audio(const char *name) {
 	return false;
 }
 
-// Whether an .m4a or .mp4 carries chapter marks.
+// Whether an .m4b, .m4a or .mp4 carries chapter marks.
 static bool mp4_has_chapters(const char *path) {
 	mp4_file_t *m = mp4_open(path);
 	if (!m) {
@@ -1160,13 +1188,11 @@ static bool mp4_has_chapters(const char *path) {
 	return marked;
 }
 
-// A book in one file whatever its neighbours: an .m4b, or an .m4a, .mp3,
-// .opus, .ogg or .flac whose chapters are marked inside it.
+// A book in one file whatever its neighbours: a file whose chapters are marked
+// inside it. Without marks a file is a part, grouped with the files around it
+// by album, whatever its format.
 static bool is_book_file(const char *path, const char *name) {
-	if (has_extension(name, ".m4b")) {
-		return true;
-	}
-	if (has_extension(name, ".m4a") || has_extension(name, ".mp4")) {
+	if (has_extension(name, ".m4b") || has_extension(name, ".m4a") || has_extension(name, ".mp4")) {
 		return mp4_has_chapters(path);
 	}
 	if (has_extension(name, ".mp3")) {

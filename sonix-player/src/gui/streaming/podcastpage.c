@@ -62,11 +62,25 @@
 // ---------------------------------------------------------------------------
 
 #define PODCAST_LIMIT PODCAST_PAGE_LIMIT
-// How many entries are held at most: four pages, like the radio stations. The
-// catalogue has no offset, so "another page" here means asking for the same
-// list with a higher limit; past this maximum the list really does stop,
-// because every entry is static memory on a device with 64 MB in all.
-#define PODCAST_MAX_HELD (4 * PODCAST_LIMIT)
+// How many entries are held at most. The catalogue has no offset, so "another
+// page" here means asking for the same list with a higher limit.
+//
+// A podcast's episodes go up to the catalogue's own maximum per request, 1000.
+// Search results and the chart stop at four pages, like the radio stations.
+// The arrays are static and sized for the larger of the two; their pages only
+// take memory once entries are written into them.
+#define PODCAST_MAX_HELD 1000
+#define PODCAST_FEEDS_MAX (4 * PODCAST_LIMIT)
+
+// Episodes are asked for in steps of this many: the first step when a podcast
+// is opened, another each time the scroll nears the bottom. Each step repeats
+// the whole request with the higher limit.
+#define PODCAST_EPISODES_STEP 100
+
+// The longest queue a tapped episode builds: it and the ones after it in the
+// list. Each queued episode that is not on the card yet gets its sidecar
+// written at the tap.
+#define PODCAST_QUEUE_MAX (4 * PODCAST_LIMIT)
 
 lv_obj_t *podcast_screen;
 lv_obj_t *podcast_list_screen; // the same object: see podcastpage.h
@@ -190,12 +204,12 @@ static void busy_show_text(bool with_text) {
 	}
 	if (busy_label) {
 		if (with_text) {
-			lv_obj_remove_flag(busy_label, LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(busy_label, false);
 		} else {
-			lv_obj_add_flag(busy_label, LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(busy_label, true);
 		}
 	}
-	lv_obj_remove_flag(busy_layer, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(busy_layer, false);
 	lv_obj_move_foreground(busy_layer);
 }
 
@@ -205,7 +219,7 @@ static void busy_show(void) { busy_show_text(false); }
 
 static void busy_hide(void) {
 	if (busy_layer) {
-		lv_obj_add_flag(busy_layer, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(busy_layer, true);
 	}
 }
 
@@ -217,8 +231,8 @@ static void build_busy_layer(void) {
 	lv_obj_set_style_bg_opa(busy_layer, LV_OPA_50, 0);
 	lv_obj_set_style_border_width(busy_layer, 0, 0);
 	lv_obj_set_style_radius(busy_layer, 0, 0);
-	lv_obj_remove_flag(busy_layer, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_add_flag(busy_layer, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_scrollable(busy_layer, false);
+	lv_obj_set_hidden(busy_layer, true);
 	lv_obj_set_flex_flow(busy_layer, LV_FLEX_FLOW_COLUMN);
 	lv_obj_set_flex_align(busy_layer, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
@@ -233,7 +247,7 @@ static void build_busy_layer(void) {
 	lv_obj_set_style_text_color(busy_label, lv_color_white(), 0);
 	lv_obj_set_style_text_font(busy_label, &font_ui_22, 0);
 	lv_obj_set_style_margin_top(busy_label, 16, 0);
-	lv_obj_add_flag(busy_label, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(busy_label, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -569,11 +583,11 @@ static void row_bind(row_t *row, int index) {
 	row->index = index;
 
 	if (index < 0 || index >= list_count) {
-		lv_obj_add_flag(row->button, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(row->button, true);
 		return;
 	}
 
-	lv_obj_remove_flag(row->button, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(row->button, false);
 	lv_obj_set_y(row->button, index * ROW_PITCH);
 
 	const char *title =
@@ -584,18 +598,18 @@ static void row_bind(row_t *row, int index) {
 	row_detail(index, detail, sizeof(detail));
 	if (detail[0]) {
 		lv_label_set_text(row->detail, detail);
-		lv_obj_remove_flag(row->detail, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(row->detail, false);
 	} else {
-		lv_obj_add_flag(row->detail, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(row->detail, true);
 	}
 
 	// The three dots belong to a podcast, not to an episode, and the same pool
 	// serves both: built on every row, shown on the lists that have something
 	// to put in it.
 	if (kind_has_row_menu(list_kind)) {
-		lv_obj_remove_flag(row->menu_btn, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(row->menu_btn, false);
 	} else {
-		lv_obj_add_flag(row->menu_btn, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(row->menu_btn, true);
 	}
 
 	paint_thumb(row->thumb, index);
@@ -647,7 +661,7 @@ static void art_forget_rows(void) {
 	// and freed afterwards.
 	for (int i = 0; i < ROW_POOL; i++) {
 		if (rows[i].button) {
-			lv_obj_add_flag(rows[i].button, LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(rows[i].button, true);
 			paint_thumb(rows[i].thumb, -1);
 		}
 		rows[i].index = -1;
@@ -760,13 +774,13 @@ static void build_rows(int width) {
 		lv_obj_set_style_pad_hor(row->button, 16, 0);
 		lv_obj_set_style_pad_ver(row->button, 0, 0);
 		lv_obj_set_style_pad_column(row->button, 8, 0);
-		lv_obj_remove_flag(row->button, LV_OBJ_FLAG_SCROLLABLE);
-		lv_obj_add_flag(row->button, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_scrollable(row->button, false);
+		lv_obj_set_hidden(row->button, true);
 		lv_obj_set_flex_flow(row->button, LV_FLEX_FLOW_ROW);
 		lv_obj_set_flex_align(row->button, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 		// Gestures (back, and pulling the player in) often start on a row, and a
 		// button keeps the press to itself.
-		lv_obj_add_flag(row->button, LV_OBJ_FLAG_EVENT_BUBBLE);
+		lv_obj_set_event_bubble(row->button, true);
 		lv_obj_add_event_cb(row->button, row_clicked_cb, LV_EVENT_CLICKED, NULL);
 		lv_obj_add_event_cb(row->button, row_long_cb, LV_EVENT_LONG_PRESSED, NULL);
 
@@ -778,7 +792,7 @@ static void build_rows(int width) {
 		row->thumb = lv_image_create(row->button);
 		lv_obj_set_size(row->thumb, ROW_THUMB, ROW_THUMB);
 		lv_image_set_inner_align(row->thumb, LV_IMAGE_ALIGN_CENTER);
-		lv_obj_add_flag(row->thumb, LV_OBJ_FLAG_EVENT_BUBBLE);
+		lv_obj_set_event_bubble(row->thumb, true);
 		paint_thumb(row->thumb, -1);
 
 		lv_obj_t *texts = lv_obj_create(row->button);
@@ -788,8 +802,8 @@ static void build_rows(int width) {
 		lv_obj_set_style_border_width(texts, 0, 0);
 		lv_obj_set_style_pad_all(texts, 0, 0);
 		lv_obj_set_style_pad_row(texts, 6, 0);
-		lv_obj_remove_flag(texts, LV_OBJ_FLAG_SCROLLABLE);
-		lv_obj_add_flag(texts, LV_OBJ_FLAG_EVENT_BUBBLE);
+		lv_obj_set_scrollable(texts, false);
+		lv_obj_set_event_bubble(texts, true);
 		lv_obj_set_flex_flow(texts, LV_FLEX_FLOW_COLUMN);
 		lv_obj_set_flex_align(texts, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 
@@ -813,7 +827,7 @@ static void build_rows(int width) {
 		lv_obj_set_style_border_width(row->menu_btn, 0, 0);
 		lv_obj_set_style_shadow_width(row->menu_btn, 0, 0);
 		lv_obj_set_style_pad_all(row->menu_btn, 0, 0);
-		lv_obj_add_flag(row->menu_btn, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(row->menu_btn, true);
 		lv_obj_add_event_cb(row->menu_btn, row_menu_cb, LV_EVENT_CLICKED, NULL);
 
 		lv_obj_t *dots = lv_image_create(row->menu_btn);
@@ -955,9 +969,9 @@ static void fill_list(int from) {
 	bool home_view = list_kind == JOB_FOLLOWED || list_kind == JOB_TRENDING;
 	if (pill_row) {
 		if (home_view) {
-			lv_obj_remove_flag(pill_row, LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(pill_row, false);
 		} else {
-			lv_obj_add_flag(pill_row, LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(pill_row, true);
 		}
 	}
 	// The magnifier and the gear belong to the SECTION, not to what is inside
@@ -977,19 +991,19 @@ static void fill_list(int from) {
 		// a full one.
 		lv_label_set_text(list_empty,
 						  list_kind == JOB_FOLLOWED ? tr("podcast_none_followed") : tr("nothing_to_show"));
-		lv_obj_remove_flag(list_empty, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(list_empty, false);
 	} else {
-		lv_obj_add_flag(list_empty, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(list_empty, true);
 	}
 
 	// A result can land after a notice has taken the page over -- the request
 	// was already on the wire when the Wi-Fi went. The list is filled anyway,
 	// so the page is whole once the notice goes, but it stays out of sight
 	// underneath it instead of half showing through.
-	if (note_label && !lv_obj_has_flag(note_label, LV_OBJ_FLAG_HIDDEN)) {
-		lv_obj_add_flag(pill_row, LV_OBJ_FLAG_HIDDEN);
-		lv_obj_add_flag(list_container, LV_OBJ_FLAG_HIDDEN);
-		lv_obj_add_flag(list_empty, LV_OBJ_FLAG_HIDDEN);
+	if (note_label && !lv_obj_is_hidden(note_label)) {
+		lv_obj_set_hidden(pill_row, true);
+		lv_obj_set_hidden(list_container, true);
+		lv_obj_set_hidden(list_empty, true);
 	}
 }
 
@@ -1180,7 +1194,7 @@ static void maybe_load_more(void) {
 	// From the LIMIT asked for last time, not from the cleaned-up count: the
 	// discards (episodes with no audio) must not shift the step of the next
 	// request.
-	job.want = result_want + PODCAST_LIMIT;
+	job.want = result_want + (current_list_job.kind == JOB_EPISODES ? PODCAST_EPISODES_STEP : PODCAST_LIMIT);
 	job.more = true;
 	start_worker();
 	submit(&job);
@@ -1443,7 +1457,8 @@ static void job_done_cb(void *user) {
 	// Come back short, the list has ended and nothing more is asked for. "My
 	// podcasts" is entirely on the card and never pages.
 	page_loading = false;
-	page_more = result_kind != JOB_FOLLOWED && result_raw >= result_want && result_count < PODCAST_MAX_HELD;
+	page_more = result_kind != JOB_FOLLOWED && result_raw >= result_want &&
+				result_count < (result_kind == JOB_EPISODES ? PODCAST_MAX_HELD : PODCAST_FEEDS_MAX);
 	list_nav_commit();
 
 	// The page only changes if the viewer is still where it expects to be.
@@ -1514,8 +1529,9 @@ static void *worker_main(void *arg) {
 		if (want <= 0) {
 			want = PODCAST_LIMIT;
 		}
-		if (want > PODCAST_MAX_HELD) {
-			want = PODCAST_MAX_HELD;
+		int cap = job.kind == JOB_EPISODES || job.kind == JOB_PLAY ? PODCAST_MAX_HELD : PODCAST_FEEDS_MAX;
+		if (want > cap) {
+			want = cap;
 		}
 		bool grow = job.more;
 		int kept = result_count;
@@ -1564,9 +1580,9 @@ static void *worker_main(void *arg) {
 				// queue reaches one that is not there yet.
 				memcpy(queued_episodes, result_episodes, sizeof(result_episodes[0]) * (size_t)n);
 				queued_count = n;
-				// Everything the arrays hold was asked for, so what came back is
-				// the whole feed: there is nothing left to go and get.
-				queued_complete = want >= PODCAST_MAX_HELD;
+				// Short of the limit asked for, or at the most the arrays hold:
+				// what came back is the whole feed.
+				queued_complete = want >= PODCAST_MAX_HELD || result_raw < want;
 			}
 			break;
 		}
@@ -1585,8 +1601,8 @@ static void *worker_main(void *arg) {
 			}
 
 			// The queue is the rest of the podcast, and the list it is built
-			// from is already the whole feed: JOB_EPISODES asks for all of it
-			// when the podcast is opened.
+			// from already holds its first step: JOB_EPISODES asks for
+			// PODCAST_EPISODES_STEP episodes when the podcast is opened.
 			//
 			// This is the fallback for the one case where it is not -- a queue
 			// resumed after a restart, or an episode reached from somewhere
@@ -1597,10 +1613,10 @@ static void *worker_main(void *arg) {
 			// The tapped episode is found again by its id rather than kept at
 			// its index: the longer list is the same list with more of it, but
 			// the id is what makes that certain.
-			if (!queued_complete && queued_count < PODCAST_MAX_HELD && queued_episodes[index].feed_id > 0) {
+			if (!queued_complete && queued_count < PODCAST_EPISODES_STEP && queued_episodes[index].feed_id > 0) {
 				long long wanted_id = queued_episodes[index].id;
 				long long feed = queued_episodes[index].feed_id;
-				int n = podcast_episodes(feed, result_episodes, PODCAST_MAX_HELD);
+				int n = podcast_episodes(feed, result_episodes, PODCAST_EPISODES_STEP);
 				if (n > queued_count) {
 					memcpy(queued_episodes, result_episodes, sizeof(result_episodes[0]) * (size_t)n);
 					queued_count = n;
@@ -1608,7 +1624,7 @@ static void *worker_main(void *arg) {
 					// The list on screen has grown too: it is the same list.
 					result_count = n;
 					result_from = 0;
-					result_want = PODCAST_MAX_HELD;
+					result_want = PODCAST_EPISODES_STEP;
 
 					int found = -1;
 					for (int i = 0; i < n; i++) {
@@ -1639,10 +1655,10 @@ static void *worker_main(void *arg) {
 			// The queue: this episode and the ones AFTER it in the list, that is,
 			// going back in time. The others are not downloaded now -- they come
 			// down when their turn arrives (see podcastpage_prepare_track).
-			static char paths[PODCAST_MAX_HELD][512];
-			static const char *path_ptr[PODCAST_MAX_HELD];
+			static char paths[PODCAST_QUEUE_MAX][512];
+			static const char *path_ptr[PODCAST_QUEUE_MAX];
 			int count = 0;
-			for (int i = index; i < queued_count && count < PODCAST_MAX_HELD; i++) {
+			for (int i = index; i < queued_count && count < PODCAST_QUEUE_MAX; i++) {
 				if (i == index) {
 					snprintf(paths[count], sizeof(paths[0]), "%s", path);
 				} else if (!podcastcache_find(queued_episodes[i].id, paths[count], sizeof(paths[0]))) {
@@ -1733,15 +1749,8 @@ static void row_clicked_cb(lv_event_t *e) {
 
 	job.kind = JOB_EPISODES;
 	job.id = result_feeds[index].id;
-	// The whole feed at once, not the first page.
-	//
-	// The queue a tapped episode builds is "this one and the ones after it", so
-	// a page-sized list would stop the queue at the end of the page. Fetching
-	// the rest at play time instead would put a whole HTTPS round trip between
-	// the tap and the first sound, which is the wait the user is watching.
-	// Asked here, it is the same single request the veil is already up for, and
-	// by the time anything is tapped the queue is complete.
-	job.want = PODCAST_MAX_HELD;
+	// The first step; the rest comes as the list is scrolled.
+	job.want = PODCAST_EPISODES_STEP;
 	snprintf(job.text, sizeof(job.text), "%s", result_feeds[index].title);
 	run(&job);
 }
@@ -1809,7 +1818,7 @@ static int dl_row = -1;
 
 static void dl_close(void) {
 	lv_timer_pause(dl_timer);
-	lv_obj_add_flag(dl_veil, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(dl_veil, true);
 	power_hold_screen_on(false);
 }
 
@@ -1857,8 +1866,9 @@ static void dl_build(gui_config_t *cfg) {
 	lv_obj_set_style_bg_opa(dl_veil, LV_OPA_60, 0);
 	lv_obj_set_style_border_width(dl_veil, 0, 0);
 	lv_obj_set_style_radius(dl_veil, 0, 0);
-	lv_obj_remove_flag(dl_veil, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_add_flag(dl_veil, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_scrollable(dl_veil, false);
+	lv_obj_set_clickable(dl_veil, true);
+	lv_obj_set_hidden(dl_veil, true);
 
 	lv_obj_t *card = lv_obj_create(dl_veil);
 	lv_obj_set_size(card, cfg->screen_width - 2 * cfg->padding, LV_SIZE_CONTENT);
@@ -1868,7 +1878,7 @@ static void dl_build(gui_config_t *cfg) {
 	lv_obj_set_style_shadow_width(card, 0, 0);
 	lv_obj_set_style_pad_all(card, 20, 0);
 	lv_obj_set_style_pad_row(card, 14, 0);
-	lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_set_scrollable(card, false);
 	lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
 	lv_obj_align(card, LV_ALIGN_CENTER, 0, cfg->top_bar_height / 2);
 
@@ -1933,7 +1943,7 @@ static void download_cb(void *user) {
 	lv_obj_set_style_bg_color(dl_bar, theme()->accent, LV_PART_INDICATOR);
 	lv_label_set_text(dl_name, episode->title);
 	dl_paint(0, 0);
-	lv_obj_remove_flag(dl_veil, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(dl_veil, false);
 	lv_obj_move_foreground(dl_veil);
 	power_hold_screen_on(true);
 	lv_timer_reset(dl_timer);
@@ -2020,9 +2030,9 @@ static void refresh_corner_buttons(void) {
 			continue;
 		}
 		if (shown[i]) {
-			lv_obj_remove_flag(buttons[i], LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(buttons[i], false);
 		} else {
-			lv_obj_add_flag(buttons[i], LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(buttons[i], true);
 		}
 	}
 }
@@ -2061,7 +2071,7 @@ static void build_page(gui_config_t *cfg) {
 	lv_obj_set_style_radius(column, 0, 0);
 	lv_obj_set_style_pad_all(column, 0, 0);
 	lv_obj_set_style_pad_gap(column, 12, 0);
-	lv_obj_remove_flag(column, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_set_scrollable(column, false);
 	lv_obj_set_flex_flow(column, LV_FLEX_FLOW_COLUMN);
 	lv_obj_set_flex_align(column, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 
@@ -2072,11 +2082,11 @@ static void build_page(gui_config_t *cfg) {
 	lv_obj_set_style_pad_ver(pill_row, 0, 0);
 	lv_obj_set_style_pad_hor(pill_row, cfg->padding, 0);
 	lv_obj_set_style_pad_gap(pill_row, 10, 0);
-	lv_obj_remove_flag(pill_row, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_set_scrollable(pill_row, false);
 	lv_obj_set_flex_flow(pill_row, LV_FLEX_FLOW_ROW);
 	// Presses that miss a pill belong to the column below, which carries the
 	// swipe-back and the player sheet.
-	lv_obj_add_flag(pill_row, LV_OBJ_FLAG_EVENT_BUBBLE);
+	lv_obj_set_event_bubble(pill_row, true);
 
 	pill_followed = make_pill(pill_row, "podcast_my_podcasts", JOB_FOLLOWED);
 	pill_trending = make_pill(pill_row, "podcast_trending", JOB_TRENDING);
@@ -2105,10 +2115,10 @@ static void build_page(gui_config_t *cfg) {
 	lv_obj_set_style_bg_opa(list_body, 0, 0);
 	lv_obj_set_style_border_width(list_body, 0, 0);
 	lv_obj_set_style_pad_all(list_body, 0, 0);
-	lv_obj_remove_flag(list_body, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_set_scrollable(list_body, false);
 	// Presses go row -> body -> container; without this they stop here and the
 	// swipes never see a gesture that began on a row.
-	lv_obj_add_flag(list_body, LV_OBJ_FLAG_EVENT_BUBBLE);
+	lv_obj_set_event_bubble(list_body, true);
 	build_rows(row_width);
 
 	// On the screen and not inside the container: it has to sit in the middle of
@@ -2123,7 +2133,7 @@ static void build_page(gui_config_t *cfg) {
 	lv_obj_add_style(list_empty, &theme_style_text_dim, 0);
 	lv_obj_set_style_text_font(list_empty, &font_ui_24, 0);
 	lv_obj_align(list_empty, LV_ALIGN_TOP_MID, 0, content_top + 140);
-	lv_obj_add_flag(list_empty, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(list_empty, true);
 
 	// The same spot, for when the section cannot work at all.
 	note_label = lv_label_create(podcast_screen);
@@ -2134,13 +2144,13 @@ static void build_page(gui_config_t *cfg) {
 	lv_obj_set_style_text_font(note_label, &font_ui_22, 0);
 	lv_obj_set_style_text_align(note_label, LV_TEXT_ALIGN_CENTER, 0);
 	lv_obj_align(note_label, LV_ALIGN_TOP_LEFT, cfg->padding, content_top + 14);
-	lv_obj_add_flag(note_label, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(note_label, true);
 
 	// The "Wi-Fi settings" row under the network notice, as on the transfer
 	// page. Created hidden; show_note puts it under the notice.
 	note_wifi_row = settingsrow_add(podcast_screen, "wi_fi_settings", NULL, note_wifi_row_cb, NULL);
 	lv_obj_set_width(note_wifi_row, cfg->screen_width - 2 * cfg->padding);
-	lv_obj_add_flag(note_wifi_row, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(note_wifi_row, true);
 
 	lv_obj_add_event_cb(list_container, list_scrolled_cb, LV_EVENT_SCROLL, NULL);
 	switcher_attach_back_gesture(podcast_screen);
@@ -2171,9 +2181,9 @@ static void refresh_search_clear(void) {
 	}
 	const char *text = lv_textarea_get_text(search_field);
 	if (text && text[0]) {
-		lv_obj_remove_flag(search_clear_btn, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(search_clear_btn, false);
 	} else {
-		lv_obj_add_flag(search_clear_btn, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(search_clear_btn, true);
 	}
 }
 
@@ -2238,7 +2248,7 @@ static void build_search_page(gui_config_t *cfg) {
 	lv_obj_set_style_shadow_width(search_clear_btn, 0, 0);
 	lv_obj_set_style_border_width(search_clear_btn, 0, 0);
 	lv_obj_set_style_pad_all(search_clear_btn, 0, 0);
-	lv_obj_add_flag(search_clear_btn, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(search_clear_btn, true);
 	lv_obj_add_event_cb(search_clear_btn, search_clear_cb, LV_EVENT_CLICKED, NULL);
 
 	lv_obj_t *search_clear_icon = lv_image_create(search_clear_btn);
@@ -2391,28 +2401,28 @@ static void show_note(const char *text) {
 		} else {
 			lv_obj_remove_local_style_prop(note_label, LV_STYLE_TEXT_COLOR, 0);
 		}
-		lv_obj_remove_flag(note_label, LV_OBJ_FLAG_HIDDEN);
-		lv_obj_add_flag(pill_row, LV_OBJ_FLAG_HIDDEN);
-		lv_obj_add_flag(list_container, LV_OBJ_FLAG_HIDDEN);
-		lv_obj_add_flag(list_empty, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(note_label, false);
+		lv_obj_set_hidden(pill_row, true);
+		lv_obj_set_hidden(list_container, true);
+		lv_obj_set_hidden(list_empty, true);
 		// The NETWORK notice brings the "Wi-Fi settings" row with it, as on the
 		// transfer page: it says what is missing AND where it is fixed. The other
 		// notices (the keys) do not.
 		if (note_wifi_row) {
 			if (wifi_note) {
-				lv_obj_remove_flag(note_wifi_row, LV_OBJ_FLAG_HIDDEN);
+				lv_obj_set_hidden(note_wifi_row, false);
 				lv_obj_update_layout(note_label); // the notice's real height
 				lv_obj_align_to(note_wifi_row, note_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 16);
 			} else {
-				lv_obj_add_flag(note_wifi_row, LV_OBJ_FLAG_HIDDEN);
+				lv_obj_set_hidden(note_wifi_row, true);
 			}
 		}
 	} else {
-		lv_obj_add_flag(note_label, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(note_label, true);
 		if (note_wifi_row) {
-			lv_obj_add_flag(note_wifi_row, LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(note_wifi_row, true);
 		}
-		lv_obj_remove_flag(list_container, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(list_container, false);
 	}
 }
 
@@ -2576,8 +2586,8 @@ static lv_obj_t *make_skip_card(lv_obj_t *parent, const char *title) {
 	lv_obj_set_style_shadow_width(card, 0, 0);
 	lv_obj_set_style_pad_all(card, 20, 0);
 	lv_obj_set_style_pad_gap(card, 18, 0);
-	lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_add_flag(card, LV_OBJ_FLAG_EVENT_BUBBLE);
+	lv_obj_set_scrollable(card, false);
+	lv_obj_set_event_bubble(card, true);
 	lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
 	lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 
@@ -2592,8 +2602,8 @@ static lv_obj_t *make_skip_card(lv_obj_t *parent, const char *title) {
 	lv_obj_set_style_border_width(row, 0, 0);
 	lv_obj_set_style_pad_all(row, 0, 0);
 	lv_obj_set_style_pad_gap(row, 14, 0);
-	lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_add_flag(row, LV_OBJ_FLAG_EVENT_BUBBLE);
+	lv_obj_set_scrollable(row, false);
+	lv_obj_set_event_bubble(row, true);
 	lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
 	lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
@@ -2642,6 +2652,9 @@ static void refresh_settings_rows(void) {
 			lv_obj_remove_state(stop_episode_switch, LV_STATE_CHECKED);
 		}
 	}
+	// The control centre switches this timer too, so the switch and the
+	// wheels are read again rather than trusted from the last visit.
+	settingsrow_duration_set_minutes(&sleep_row, sleeptimer_minutes(SLEEPTIMER_PODCAST));
 	settingsrow_duration_expanded(&sleep_row, sleeptimer_enabled(SLEEPTIMER_PODCAST));
 	settingsrow_duration_repaint(&sleep_row);
 }
@@ -2682,12 +2695,16 @@ static void build_settings_page(gui_config_t *cfg) {
 	refresh_settings_rows();
 	theme_register_refresh(refresh_settings_rows);
 	lv_obj_add_event_cb(settings_screen, settings_rows_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
+	// And when the control centre switches the timer with the page under it.
+	lv_obj_add_event_cb(settings_screen, settings_rows_loaded_cb, LV_EVENT_REFRESH, NULL);
 	switcher_attach_back_gesture(settings_screen);
 }
 
 // ---------------------------------------------------------------------------
 // from outside
 // ---------------------------------------------------------------------------
+
+lv_obj_t *podcastpage_settings_screen(void) { return settings_screen; }
 
 bool podcastpage_open_feed(long long feed_id, const char *title) {
 	if (feed_id <= 0 || !podcast_configured()) {
@@ -2702,6 +2719,7 @@ bool podcastpage_open_feed(long long feed_id, const char *title) {
 	job_t job = {0};
 	job.kind = JOB_EPISODES;
 	job.id = feed_id;
+	job.want = PODCAST_EPISODES_STEP;
 	snprintf(job.text, sizeof(job.text), "%s", title && title[0] ? title : tr("podcasts"));
 	run(&job);
 	return true;

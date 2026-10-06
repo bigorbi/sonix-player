@@ -27,6 +27,10 @@ void musicsettings_set_mseb_enabled(bool enabled);
 // Both are shortcuts, not second copies -- they read and write the one
 // setting, and the page follows.
 lv_obj_t *musicsettings_fade_screen(void);
+
+// The playback options page, which holds the music sleep timer: what the
+// control centre's sleep button for music opens on a long press.
+lv_obj_t *musicsettings_playback_screen(void);
 bool musicsettings_fade_enabled(void);
 void musicsettings_set_fade_enabled(bool enabled);
 
@@ -41,5 +45,10 @@ bool musicsettings_endless_shuffle(void);
 
 bool musicsettings_high_gain(void);
 void musicsettings_set_high_gain(bool enabled);
+
+// Gapless playback, which the control centre also switches. The getter answers
+// with what the audio engine is doing, the one state both places draw.
+bool musicsettings_gapless_enabled(void);
+void musicsettings_set_gapless_enabled(bool enabled);
 
 #endif /* MUSICSETTINGS_H */

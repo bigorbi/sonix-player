@@ -168,6 +168,68 @@ typedef struct {
 // a second acquisition there would be a deadlock rather than a bug report.
 #define AUDIO_DEFAULT_PCM "default"
 static char output_pcm[160] = AUDIO_DEFAULT_PCM;
+
+// ---------------------------------------------------------------------------
+// 32-bit samples on the built-in card
+//
+// The card's DMA driver (soc_aic.ko) takes S16_LE and S24_LE and nothing
+// else. Asked for S32_LE, the "default" plug converts to S24_LE itself, and
+// a plug that converts reaches the card through mmap: it writes the converted
+// samples straight into the DMA buffer, mapped into this process by the
+// driver's own aic_dma_pcm_mmap() -- a remap_pfn_range() over the buffer's
+// pages with the cache attribute bits cleared. The stock player never takes
+// that path: it imports snd_pcm_writei and none of the mmap calls.
+//
+// Twice now the kernel has died on memory overwritten with values shaped
+// exactly like that conversion's output -- 0x003693ef in an anon_vma pointer,
+// then 0x007f20d0 over kernel code, 24-bit samples in 32-bit words -- both
+// times on a player that had been playing 24-bit tracks through it. So the
+// card is asked for S24_LE directly, the samples are shifted here, and the
+// plug, with nothing to convert, passes plain writes through to the driver's
+// copy path, the one the stock player has always used.
+//
+// The shift is the plug's own, checked against alsa-lib byte for byte: an
+// arithmetic shift of the 32-bit word by eight, sign carried into the top
+// byte, which leaves a DoP marker and its sixteen bits exactly where the DAC
+// has always found them.
+// ---------------------------------------------------------------------------
+
+// Whether 32-bit frames for `pcm` go out as S24_LE. Decided from the handle's
+// own name, so it is right for a handle that fell back to the card.
+static bool pcm_takes_s24(snd_pcm_t *pcm, int bits) {
+	const char *name = (pcm && bits == 32) ? snd_pcm_name(pcm) : NULL;
+	return name && strcmp(name, AUDIO_DEFAULT_PCM) == 0;
+}
+
+typedef struct {
+	int32_t *data;
+	size_t capacity; // in samples
+} s24_scratch_t;
+
+// The frames shifted into S24_LE, in `scratch`. The caller's buffer is left
+// alone: a write that is retried after an underrun hands the same buffer in
+// again. NULL when the scratch cannot be grown.
+static const void *s24_from_s32(s24_scratch_t *scratch, const void *buf, size_t samples) {
+	if (samples > scratch->capacity) {
+		int32_t *grown = realloc(scratch->data, samples * sizeof(int32_t));
+		if (!grown) {
+			return NULL;
+		}
+		scratch->data = grown;
+		scratch->capacity = samples;
+	}
+	const int32_t *in = buf;
+	for (size_t i = 0; i < samples; i++) {
+		scratch->data[i] = in[i] >> 8;
+	}
+	return scratch->data;
+}
+
+// One each for the decode loop and the external sources, which write from
+// threads of their own.
+static s24_scratch_t playback_s24;
+static s24_scratch_t external_s24;
+
 static pthread_mutex_t output_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static pthread_t playback_thread;
@@ -468,6 +530,25 @@ static double progress_current_secs = 0.0;
 // it, and the floor lifts by itself as soon as real progress passes it. -1
 // means no floor.
 static double progress_floor_secs = -1.0;
+
+// The position to report for a file that is being opened: where a seek already
+// waiting for it will put it, or 0. A reopen at the same point -- the output
+// moving to or from the headphones -- is a play and a seek, and reporting 0
+// until the seek is reached drew the bar at the start and back. Caller holds
+// audio_mutex.
+static double opening_position(void) {
+	return seek_request && seek_target_secs > 0 ? seek_target_secs : 0.0;
+}
+
+// The position after a block has gone out, unless a seek has been asked for
+// meanwhile: audio_seek() already reports its target, and the block that was
+// being written when it arrived belongs to the old position. Caller holds
+// audio_mutex.
+static void report_position(double seconds) {
+	if (!seek_request) {
+		progress_current_secs = seconds;
+	}
+}
 
 // Playback speed, for audiobooks. It lives here rather than being handed in
 // with the track because it can be changed while one is playing, from the
@@ -1338,7 +1419,9 @@ static snd_pcm_t *open_pcm_device_now(int channels, int sample_rate, int bits_pe
 	} else if (bits_per_sample == 24) {
 		format = SND_PCM_FORMAT_S24_3LE;
 	} else if (bits_per_sample == 32) {
-		format = SND_PCM_FORMAT_S32_LE;
+		// The built-in card in its own format, so that nothing converts on
+		// the way; see pcm_takes_s24().
+		format = pcm_takes_s24(pcm_handle, 32) ? SND_PCM_FORMAT_S24_LE : SND_PCM_FORMAT_S32_LE;
 	} else {
 		fprintf(stderr, "Audio: Unsupported bits per sample: %d\n", bits_per_sample);
 		snd_pcm_close(pcm_handle);
@@ -2131,6 +2214,9 @@ static snd_pcm_sframes_t pcm_write_recover(snd_pcm_t **pcm, const void *buf, snd
 			written = -EIO; // skip the writei and go straight to the rebuild
 		} else if (pcm_is_bluetooth(*pcm)) {
 			written = pcm_write_bluetooth(*pcm, buf, frames, channels * (bits / 8));
+		} else if (pcm_takes_s24(*pcm, bits)) {
+			const void *s24 = s24_from_s32(&playback_s24, buf, (size_t)frames * (size_t)channels);
+			written = s24 ? snd_pcm_writei(*pcm, s24, frames) : -ENOMEM;
 		} else {
 			written = snd_pcm_writei(*pcm, buf, frames);
 		}
@@ -2404,7 +2490,7 @@ static void play_wav_file(const char *filepath) {
 	int src_frame_bytes = info.src_frame_bytes;
 	pthread_mutex_lock(&audio_mutex);
 	progress_total_secs = (double)info.data_size / bytes_per_sec;
-	progress_current_secs = 0.0;
+	progress_current_secs = opening_position();
 	progress_floor_secs = -1.0;
 	stream_sample_rate = info.sample_rate;
 	stream_channels = info.channels;
@@ -2807,7 +2893,7 @@ static void play_wav_file(const char *filepath) {
 		health_tick(&health, info.sample_rate, info.sample_rate, info.bits_per_sample);
 		host_pace(written, info.sample_rate);
 		pthread_mutex_lock(&audio_mutex);
-		progress_current_secs = (double)bytes_played / bytes_per_sec;
+		report_position((double)bytes_played / bytes_per_sec);
 		pthread_mutex_unlock(&audio_mutex);
 	}
 
@@ -2980,7 +3066,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 
 	pthread_mutex_lock(&audio_mutex);
 	progress_total_secs = (double)total_frames / sample_rate;
-	progress_current_secs = 0.0;
+	progress_current_secs = opening_position();
 	progress_floor_secs = -1.0;
 	stream_sample_rate = sample_rate;
 	stream_channels = channels;
@@ -3581,7 +3667,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 		health_tick(&health, sample_rate, out_rate, source_bits);
 		host_pace(written, out_rate);
 		pthread_mutex_lock(&audio_mutex);
-		progress_current_secs = (double)bytes_played / bytes_per_sec;
+		report_position((double)bytes_played / bytes_per_sec);
 		pthread_mutex_unlock(&audio_mutex);
 	}
 
@@ -4464,8 +4550,11 @@ int audio_external_write(const void *frames, int count) {
 	int written = 0;
 	long last_progress_ms = log_ms();
 	while (written < count) {
-		snd_pcm_sframes_t got = snd_pcm_writei(external_pcm, (const char *)frames + (size_t)written * external_frame_bytes,
-											   (snd_pcm_uframes_t)(count - written));
+		const void *chunk = (const char *)frames + (size_t)written * external_frame_bytes;
+		if (pcm_takes_s24(external_pcm, external_bits)) {
+			chunk = s24_from_s32(&external_s24, chunk, (size_t)(count - written) * (size_t)external_channels);
+		}
+		snd_pcm_sframes_t got = chunk ? snd_pcm_writei(external_pcm, chunk, (snd_pcm_uframes_t)(count - written)) : -ENOMEM;
 		if (got > 0) {
 			written += (int)got;
 			last_progress_ms = log_ms();

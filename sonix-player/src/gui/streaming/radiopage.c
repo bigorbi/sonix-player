@@ -73,6 +73,16 @@ typedef struct {
 #define PLAYMARK_INSET 4 // from the row's left edge
 #define ROW_PAD_HOR 14
 
+// radio.txt's headings: a line of dim text over the first station of each
+// group, in the gap the group's rows are pushed down by. Only that list has
+// them, so only that list's rows are placed from a table rather than at a
+// fixed pitch.
+#define HEADING_HEIGHT 56
+static int custom_row_y[RADIO_CUSTOM_MAX]; // where each station row sits
+static int custom_list_height;
+static lv_obj_t *heading_labels[RADIO_CUSTOM_MAX];
+static int heading_count;
+
 // The radio.txt line the rows were last marked for, -1 for none.
 static int marked_custom = -1;
 
@@ -164,12 +174,12 @@ static bool wifi_is_connected(void) {
 
 static void hide(lv_obj_t *o) {
 	if (o) {
-		lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(o, true);
 	}
 }
 static void show(lv_obj_t *o) {
 	if (o) {
-		lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(o, false);
 	}
 }
 
@@ -336,9 +346,9 @@ static void sort_button_update(void) {
 	}
 	if (list_mode == LIST_TERMS) {
 		lv_image_set_src(sort_icon, terms_desc(list_browse) ? &icon_sort_za : &icon_sort_az);
-		lv_obj_remove_flag(sort_btn, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(sort_btn, false);
 	} else {
-		lv_obj_add_flag(sort_btn, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(sort_btn, true);
 		azindex_set_rows(list_index, NULL, 0, false);
 	}
 }
@@ -379,6 +389,59 @@ static void row_update_playmark(row_t *row) {
 	}
 }
 
+static bool list_has_headings(void) { return list_mode == LIST_CUSTOM && heading_count > 0; }
+
+static int row_y(int index) {
+	if (list_has_headings() && index >= 0 && index < RADIO_CUSTOM_MAX) {
+		return custom_row_y[index];
+	}
+	return index * ROW_PITCH;
+}
+
+static int list_height(int count) {
+	if (list_has_headings()) {
+		return custom_list_height;
+	}
+	return count > 0 ? count * ROW_PITCH : ROW_PITCH;
+}
+
+// The headings of radio.txt, made again with the list. The labels belong to
+// this list alone, so any other list clears them.
+static void headings_layout(void) {
+	for (int i = 0; i < heading_count; i++) {
+		lv_obj_delete(heading_labels[i]);
+	}
+	heading_count = 0;
+	custom_list_height = 0;
+	if (list_mode != LIST_CUSTOM) {
+		return;
+	}
+
+	int line = lv_font_get_line_height(&font_ui_22);
+	int width = lv_obj_get_style_width(list_body, LV_PART_MAIN);
+	int y = 0;
+	for (int i = 0; i < station_count && i < RADIO_CUSTOM_MAX; i++) {
+		char text[RADIO_NAME_MAX];
+		if (radio_custom_heading(i, text, sizeof(text))) {
+			lv_obj_t *label = lv_label_create(list_body);
+			lv_label_set_text(label, text);
+			lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+			lv_obj_set_width(label, width - 2 * ROW_PAD_HOR);
+			lv_obj_add_style(label, &theme_style_text_dim, 0);
+			lv_obj_set_style_text_font(label, &font_ui_22, 0);
+			// Close over its own rows rather than midway in the gap, so it
+			// reads as their title and not as the previous group's last line.
+			lv_obj_set_pos(label, ROW_PAD_HOR / 2, y + HEADING_HEIGHT - line - 10);
+			lv_obj_set_clickable(label, false);
+			heading_labels[heading_count++] = label;
+			y += HEADING_HEIGHT;
+		}
+		custom_row_y[i] = y;
+		y += ROW_PITCH;
+	}
+	custom_list_height = y > 0 ? y : ROW_PITCH;
+}
+
 static void row_bind(row_t *row, int index) {
 	row->index = index;
 	row_update_playmark(row);
@@ -389,7 +452,7 @@ static void row_bind(row_t *row, int index) {
 	}
 
 	show(row->button);
-	lv_obj_set_y(row->button, index * ROW_PITCH);
+	lv_obj_set_y(row->button, row_y(index));
 
 	if (list_mode == LIST_TERMS) {
 		lv_label_set_text(row->name, terms[index].label);
@@ -452,7 +515,8 @@ static void list_rebuild_keep(bool keep_scroll) {
 	int count = list_count();
 	marked_station_update(); // the rows below are marked from it
 
-	lv_obj_set_height(list_body, count > 0 ? count * ROW_PITCH : ROW_PITCH);
+	headings_layout();
+	lv_obj_set_height(list_body, list_height(count));
 	if (!keep_scroll) {
 		lv_obj_scroll_to_y(list_view, 0, LV_ANIM_OFF);
 	}
@@ -480,6 +544,15 @@ static void list_window_update(void) {
 	}
 
 	int first = (scroll / ROW_PITCH) - 1;
+	if (list_has_headings()) {
+		// The first row whose bottom is below the top of the view, and one
+		// before it, as the fixed pitch would give.
+		first = 0;
+		while (first < count && custom_row_y[first] + ROW_HEIGHT <= scroll) {
+			first++;
+		}
+		first--;
+	}
 	if (first + ROW_POOL > count) {
 		first = count - ROW_POOL;
 	}
@@ -883,8 +956,8 @@ static void build_list_page(gui_config_t *cfg) {
 	lv_obj_set_style_bg_opa(list_body, 0, 0);
 	lv_obj_set_style_border_width(list_body, 0, 0);
 	lv_obj_set_style_pad_all(list_body, 0, 0);
-	lv_obj_remove_flag(list_body, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_add_flag(list_body, LV_OBJ_FLAG_EVENT_BUBBLE);
+	lv_obj_set_scrollable(list_body, false);
+	lv_obj_set_event_bubble(list_body, true);
 
 	list_message = lv_label_create(list_view);
 	lv_label_set_text(list_message, "");
@@ -913,7 +986,7 @@ static void build_list_page(gui_config_t *cfg) {
 		lv_obj_set_style_pad_ver(row->button, 10, 0);
 		lv_obj_set_style_pad_column(row->button, 14, 0);
 		hide(row->button);
-		lv_obj_add_flag(row->button, LV_OBJ_FLAG_EVENT_BUBBLE);
+		lv_obj_set_event_bubble(row->button, true);
 		lv_obj_add_event_cb(row->button, row_clicked_cb, LV_EVENT_CLICKED, NULL);
 		lv_obj_set_flex_flow(row->button, LV_FLEX_FLOW_ROW);
 		lv_obj_set_flex_align(row->button, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -929,8 +1002,8 @@ static void build_list_page(gui_config_t *cfg) {
 		lv_obj_set_style_bg_opa(text, 0, 0);
 		lv_obj_set_style_border_width(text, 0, 0);
 		lv_obj_set_style_pad_all(text, 0, 0);
-		lv_obj_remove_flag(text, LV_OBJ_FLAG_SCROLLABLE);
-		lv_obj_add_flag(text, LV_OBJ_FLAG_EVENT_BUBBLE);
+		lv_obj_set_scrollable(text, false);
+		lv_obj_set_event_bubble(text, true);
 		lv_obj_set_flex_flow(text, LV_FLEX_FLOW_COLUMN);
 		lv_obj_set_flex_align(text, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 		lv_obj_set_style_pad_row(text, 4, 0);
@@ -953,16 +1026,16 @@ static void build_list_page(gui_config_t *cfg) {
 		lv_obj_set_flex_flow(row->detail, LV_FLEX_FLOW_ROW);
 		lv_obj_set_flex_align(row->detail, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 		lv_obj_set_style_pad_column(row->detail, 8, 0);
-		lv_obj_remove_flag(row->detail, LV_OBJ_FLAG_SCROLLABLE);
-		lv_obj_remove_flag(row->detail, LV_OBJ_FLAG_CLICKABLE);
-		lv_obj_add_flag(row->detail, LV_OBJ_FLAG_EVENT_BUBBLE);
+		lv_obj_set_scrollable(row->detail, false);
+		lv_obj_set_clickable(row->detail, false);
+		lv_obj_set_event_bubble(row->detail, true);
 		hide(row->detail);
 
 		// White, tinted per row with the colour of its quality.
 		row->quality = lv_image_create(row->detail);
 		lv_image_set_src(row->quality, &icon_radio_quality);
 		lv_obj_set_style_image_recolor_opa(row->quality, LV_OPA_COVER, 0);
-		lv_obj_remove_flag(row->quality, LV_OBJ_FLAG_CLICKABLE);
+		lv_obj_set_clickable(row->quality, false);
 		hide(row->quality);
 
 		row->code = lv_label_create(row->detail);
@@ -994,7 +1067,7 @@ static void build_list_page(gui_config_t *cfg) {
 		// Outside the flex layout, in the row's own left padding: it marks the
 		// row without moving anything on it.
 		row->playmark = lv_obj_create(row->button);
-		lv_obj_add_flag(row->playmark, LV_OBJ_FLAG_IGNORE_LAYOUT);
+		lv_obj_set_ignore_layout(row->playmark, true);
 		lv_obj_set_size(row->playmark, PLAYMARK_WIDTH, PLAYMARK_HEIGHT);
 		lv_obj_align(row->playmark, LV_ALIGN_LEFT_MID, PLAYMARK_INSET - ROW_PAD_HOR, 0);
 		lv_obj_add_style(row->playmark, &theme_style_accent_bg, 0);
@@ -1002,8 +1075,8 @@ static void build_list_page(gui_config_t *cfg) {
 		lv_obj_set_style_border_width(row->playmark, 0, 0);
 		lv_obj_set_style_shadow_width(row->playmark, 0, 0);
 		lv_obj_set_style_pad_all(row->playmark, 0, 0);
-		lv_obj_remove_flag(row->playmark, LV_OBJ_FLAG_SCROLLABLE);
-		lv_obj_remove_flag(row->playmark, LV_OBJ_FLAG_CLICKABLE);
+		lv_obj_set_scrollable(row->playmark, false);
+		lv_obj_set_clickable(row->playmark, false);
 		hide(row->playmark);
 
 		row->index = -1;
@@ -1019,7 +1092,7 @@ static void build_list_page(gui_config_t *cfg) {
 	lv_obj_set_style_pad_all(sort_btn, 0, 0);
 	lv_obj_align(sort_btn, LV_ALIGN_TOP_RIGHT, -cfg->padding, cfg->padding + cfg->top_bar_height);
 	lv_obj_add_event_cb(sort_btn, sort_clicked_cb, LV_EVENT_CLICKED, NULL);
-	lv_obj_add_flag(sort_btn, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(sort_btn, true);
 
 	sort_icon = lv_image_create(sort_btn);
 	lv_image_set_src(sort_icon, &icon_sort_az);

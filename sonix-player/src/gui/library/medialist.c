@@ -144,6 +144,7 @@ typedef struct {
 	bool thumb_requested;
 	bool thumb_settled;
 	cover_image_t thumb;
+	char thumb_path[512]; // the file the picture, or the request for it, is of
 } row_t;
 
 // Everything one of the two screens owns.
@@ -272,7 +273,13 @@ static unsigned sort_desc_mask;
 // Which lists run by when their files arrived rather than by name. Same shape
 // as sort_desc_mask, and the two combine: "newest first" is by date, reversed.
 static unsigned sort_added_mask;
-static bool artist_album_order; // an artist's tracks grouped by record
+// Which lists run by release year. Same shape again; a list is by year or by
+// date or by name, never two of them, and the direction bit says which way.
+static unsigned sort_year_mask;
+// The disc button on an artist's own lists: on, an artist opened as a track
+// list -- from the search, or from the Artists list with Album view off --
+// opens as their records instead.
+static bool artist_records;
 
 // Whether an artist opens as a list of their records. On by default: an artist
 // with a dozen albums is a dozen rows this way and four hundred the other.
@@ -283,12 +290,15 @@ static bool album_view = true;
 // way down.
 static bool quality_badges;
 
+// "Go to the current track": the five lists the Music page opens start at the
+// row of whatever is playing. Off by default.
+static bool go_to_current;
+
 // "Show artist": the artist under each row's title, on the lists picked out by
 // artist_lists (MEDIALIST_ARTIST_* bits). Off by default, with all of them
 // picked so that switching it on shows something at once.
 static bool show_artist;
-static int artist_lists =
-	MEDIALIST_ARTIST_TRACKS | MEDIALIST_ARTIST_ALBUMS | MEDIALIST_ARTIST_GENRES | MEDIALIST_ARTIST_FAVOURITES;
+static int artist_lists = MEDIALIST_ARTIST_ALL;
 
 // Both are read on first use rather than in medialist_init(): the music
 // settings page is built before it (see gui_init), so a switch built from these
@@ -304,6 +314,7 @@ static void load_view_settings(void) {
 	album_view = config_get_int("library", "album_view", 1) != 0;
 	quality_badges = config_get_int("library", "quality_badges", 0) != 0;
 	show_artist = config_get_int("library", "show_artist", 0) != 0;
+	go_to_current = config_get_int("library", "go_to_current", 0) != 0;
 	artist_lists = (int)config_get_int("library", "artist_lists", artist_lists);
 }
 
@@ -316,6 +327,18 @@ void medialist_set_album_view(bool on) {
 	load_view_settings();
 	album_view = on;
 	config_set_int("library", "album_view", on ? 1 : 0);
+	config_save();
+}
+
+bool medialist_go_to_current(void) {
+	load_view_settings();
+	return go_to_current;
+}
+
+void medialist_set_go_to_current(bool on) {
+	load_view_settings();
+	go_to_current = on;
+	config_set_int("library", "go_to_current", on ? 1 : 0);
 	config_save();
 }
 
@@ -348,6 +371,18 @@ static void sort_set_added(library_list_t kind, bool added) {
 	config_save();
 }
 
+static bool sort_is_year(library_list_t kind) { return (sort_year_mask & (1u << (unsigned)kind)) != 0; }
+
+static void sort_set_year(library_list_t kind, bool year) {
+	if (year) {
+		sort_year_mask |= 1u << (unsigned)kind;
+	} else {
+		sort_year_mask &= ~(1u << (unsigned)kind);
+	}
+	config_set_int("library", "sort_year", (long)sort_year_mask);
+	config_save();
+}
+
 // The lists that can run by date as well as by name: every track, every
 // record, every artist and every album artist -- the last three by their
 // newest file, so an artist with a new record comes up with it. Genres have no
@@ -357,6 +392,31 @@ static bool sort_can_date(library_list_t kind, library_filter_t filter) {
 	return (kind == LIBRARY_LIST_TRACKS || kind == LIBRARY_LIST_ALBUMS || kind == LIBRARY_LIST_ARTISTS ||
 			kind == LIBRARY_LIST_ALBUM_ARTISTS) &&
 		   filter == LIBRARY_FILTER_NONE;
+}
+
+// The lists that can run by release year: every track and every record. An
+// artist has no year of their own -- the first record and the last are both
+// fair answers -- so the name lists stay out.
+static bool sort_can_year(library_list_t kind, library_filter_t filter) {
+	return (kind == LIBRARY_LIST_TRACKS || kind == LIBRARY_LIST_ALBUMS) && filter == LIBRARY_FILTER_NONE;
+}
+
+// The order a list is opened with, and whether the handle reads it backwards.
+// Z-A and newest first are the ascending list read backwards; by year the
+// database runs it either way itself, so the rows without a year stay at the
+// end in both.
+static void sort_order_for(library_list_t kind, library_filter_t filter, library_order_t *order, bool *desc) {
+	bool reversed = sort_is_desc(kind);
+	if (sort_can_year(kind, filter) && sort_is_year(kind)) {
+		*order = reversed ? LIBRARY_ORDER_YEAR_DESC : LIBRARY_ORDER_YEAR;
+		*desc = false;
+	} else if (sort_can_date(kind, filter) && sort_is_added(kind)) {
+		*order = LIBRARY_ORDER_ADDED;
+		*desc = reversed;
+	} else {
+		*order = LIBRARY_ORDER_DEFAULT;
+		*desc = reversed;
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -430,17 +490,17 @@ static void panel_refresh_stale(panel_t *p) {
 	p->window_first = -1;
 	p->window_count = 0;
 
-	// The rows underneath have moved, so every pooled row has to be bound
-	// again, and the letters have to be counted again.
+	// The rows underneath may have moved, so every pooled row has to be bound
+	// again, and the letters have to be counted again. A row that comes back
+	// with the same file keeps its picture (row_bind).
 	for (int i = 0; i < ROW_POOL; i++) {
-		row_drop_thumb(p, &p->rows[i]);
 		p->rows[i].index = -2;
 	}
 	lv_obj_set_height(p->body, p->count ? p->count * ROW_PITCH : ROW_PITCH);
 	if (p->count == 0) {
-		lv_obj_remove_flag(p->empty, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(p->empty, false);
 	} else {
-		lv_obj_add_flag(p->empty, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(p->empty, true);
 	}
 	index_rebuild(p, p->index_wanted, p->index_desc);
 }
@@ -637,6 +697,7 @@ static void row_drop_thumb(panel_t *p, row_t *row) {
 
 	row->thumb_requested = false;
 	row->thumb_settled = false;
+	row->thumb_path[0] = '\0';
 }
 
 // ---------------------------------------------------------------------------
@@ -653,6 +714,9 @@ static void row_drop_thumb(panel_t *p, row_t *row) {
 
 static char np_path[512];
 static char np_album[256];
+// The playing track's record as an Albums row names it -- the name and the key
+// that tells same-named albums apart -- or empty when the file is not indexed.
+static char np_album_value[300];
 static char np_artist[256];
 static char np_album_artist[256];
 static char np_genre[128];
@@ -666,6 +730,9 @@ static void np_cache_refresh(void) {
 	snprintf(np_artist, sizeof(np_artist), "%s", state.metadata.artist);
 	snprintf(np_album_artist, sizeof(np_album_artist), "%s", state.metadata.album_artist);
 	snprintf(np_genre, sizeof(np_genre), "%s", state.metadata.genre);
+	if (!np_path[0] || !library_track_album_value(np_path, np_album_value, sizeof(np_album_value))) {
+		np_album_value[0] = '\0';
+	}
 
 	// An album with no album-artist tag still belongs to its artist, which is
 	// what the mark in Album artists is looked up by.
@@ -696,7 +763,13 @@ static bool entry_is_now_playing(panel_t *p, int index) {
 	}
 	switch (p->kind) {
 	case LIBRARY_LIST_ALBUMS:
-		return np_album[0] && strcmp(name, np_album) == 0;
+		// A row is named by album and key. The key decides when the index knows
+		// the file; a track it does not know has only its tag, which matches
+		// every album of that name.
+		if (np_album_value[0]) {
+			return strcmp(name, np_album_value) == 0;
+		}
+		return np_album[0] && library_album_same(name, np_album);
 	case LIBRARY_LIST_ARTISTS:
 		return np_artist[0] && strcmp(name, np_artist) == 0;
 	case LIBRARY_LIST_ALBUM_ARTISTS:
@@ -713,9 +786,9 @@ static void row_update_playmark(panel_t *p, row_t *row) {
 		return;
 	}
 	if (entry_is_now_playing(p, row->index)) {
-		lv_obj_remove_flag(row->playmark, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(row->playmark, false);
 	} else {
-		lv_obj_add_flag(row->playmark, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(row->playmark, true);
 	}
 }
 
@@ -743,7 +816,7 @@ static void row_update_quality(panel_t *p, row_t *row, const char *path) {
 		return;
 	}
 	if (!quality_badges || !path || !path[0]) {
-		lv_obj_add_flag(row->quality, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(row->quality, true);
 		return;
 	}
 
@@ -767,17 +840,17 @@ static void row_update_quality(panel_t *p, row_t *row, const char *path) {
 	(void)p;
 
 	if (!icon) {
-		lv_obj_add_flag(row->quality, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(row->quality, true);
 		return;
 	}
 	lv_image_set_src(row->quality, icon);
-	lv_obj_remove_flag(row->quality, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(row->quality, false);
 }
 
 // Whether this list is one "Show artist" is on for: all the tracks, the albums
-// and the tracks inside one, the tracks of a genre, or the favourites. Not an artist's own
-// lists, where the name is the page's title already, and not the name lists,
-// whose rows are artists or genres themselves.
+// and the tracks inside one, a genre's albums and tracks, the favourites, or a
+// playlist. Not an artist's own lists, where the name is the page's title
+// already, and not the name lists, whose rows are artists or genres themselves.
 static bool panel_shows_artist(const panel_t *p) {
 	if (!show_artist || p->from_paths) {
 		return false;
@@ -789,11 +862,14 @@ static bool panel_shows_artist(const panel_t *p) {
 		(p->kind == LIBRARY_LIST_TRACKS && p->filter == LIBRARY_FILTER_ALBUM)) {
 		return (artist_lists & MEDIALIST_ARTIST_ALBUMS) != 0;
 	}
-	if (p->kind == LIBRARY_LIST_TRACKS && p->filter == LIBRARY_FILTER_GENRE) {
+	if ((p->kind == LIBRARY_LIST_TRACKS || p->kind == LIBRARY_LIST_ALBUMS) && p->filter == LIBRARY_FILTER_GENRE) {
 		return (artist_lists & MEDIALIST_ARTIST_GENRES) != 0;
 	}
 	if (p->kind == LIBRARY_LIST_FAVOURITES) {
 		return (artist_lists & MEDIALIST_ARTIST_FAVOURITES) != 0;
+	}
+	if (p->kind == LIBRARY_LIST_PLAYLIST) {
+		return (artist_lists & MEDIALIST_ARTIST_PLAYLISTS) != 0;
 	}
 	return false;
 }
@@ -811,16 +887,16 @@ static void row_update_detail(panel_t *p, row_t *row, int index, const char *pat
 	}
 	if (artist) {
 		lv_label_set_text(row->artist, artist);
-		lv_obj_remove_flag(row->artist, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(row->artist, false);
 	} else {
-		lv_obj_add_flag(row->artist, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(row->artist, true);
 	}
 
-	bool badge = row->quality && !lv_obj_has_flag(row->quality, LV_OBJ_FLAG_HIDDEN);
+	bool badge = row->quality && !lv_obj_is_hidden(row->quality);
 	if (badge || artist) {
-		lv_obj_remove_flag(row->detail, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(row->detail, false);
 	} else {
-		lv_obj_add_flag(row->detail, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(row->detail, true);
 	}
 }
 
@@ -872,16 +948,16 @@ static void row_update_selection(panel_t *p, row_t *row, const char *name, const
 	bool chosen = p->selecting && sel_find(p, row_key(p, row->index, name, path, buf, sizeof(buf))) >= 0;
 	if (chosen) {
 		lv_obj_set_style_image_recolor(row->check, theme()->accent, 0);
-		lv_obj_remove_flag(row->check, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(row->check, false);
 	} else {
-		lv_obj_add_flag(row->check, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(row->check, true);
 	}
 	lv_obj_t *usual = row->menu_btn ? row->menu_btn : row->chevron;
 	if (usual) {
 		if (p->selecting) {
-			lv_obj_add_flag(usual, LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(usual, true);
 		} else {
-			lv_obj_remove_flag(usual, LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(usual, false);
 		}
 	}
 }
@@ -893,7 +969,7 @@ static void rows_update_selection(panel_t *p) {
 		if (row->index >= 0 && row->index < p->count && row_at(p, row->index, &name, &path)) {
 			row_update_selection(p, row, name, path);
 		} else {
-			lv_obj_add_flag(row->check, LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(row->check, true);
 		}
 	}
 }
@@ -923,9 +999,9 @@ static lv_obj_t **corner_usual(panel_t *p, int *count) {
 
 static void show_if(lv_obj_t *obj, bool show) {
 	if (show) {
-		lv_obj_remove_flag(obj, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(obj, false);
 	} else {
-		lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(obj, true);
 	}
 }
 
@@ -954,7 +1030,7 @@ static void selection_stop(panel_t *p) {
 	lv_obj_t **buttons = corner_usual(p, &n);
 	for (int i = 0; i < n; i++) {
 		if (buttons[i] && (p->corner_shown & (1u << i))) {
-			lv_obj_remove_flag(buttons[i], LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(buttons[i], false);
 		}
 	}
 	sel_buttons_show(p, false);
@@ -973,9 +1049,9 @@ static void selection_start(panel_t *p) {
 	int n = 0;
 	lv_obj_t **buttons = corner_usual(p, &n);
 	for (int i = 0; i < n; i++) {
-		if (buttons[i] && !lv_obj_has_flag(buttons[i], LV_OBJ_FLAG_HIDDEN)) {
+		if (buttons[i] && !lv_obj_is_hidden(buttons[i])) {
 			p->corner_shown |= 1u << i;
-			lv_obj_add_flag(buttons[i], LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(buttons[i], true);
 		}
 	}
 	sel_buttons_show(p, true);
@@ -1352,25 +1428,27 @@ static void row_bind(panel_t *p, row_t *row, int index) {
 		return;
 	}
 
-	row_drop_thumb(p, row);
-	row->index = index;
-
-	if (index < 0 || index >= p->count) {
-		lv_obj_add_flag(row->button, LV_OBJ_FLAG_HIDDEN);
-		return;
-	}
-
 	const char *name = NULL;
 	const char *path = NULL;
-	if (!row_at(p, index, &name, &path)) {
-		// The handle went stale under the list, or the row is gone. Hiding the
-		// row is what a reload will fix; drawing a neighbour's name would not
-		// look like a fault at all.
-		lv_obj_add_flag(row->button, LV_OBJ_FLAG_HIDDEN);
+	bool found = index >= 0 && index < p->count && row_at(p, index, &name, &path);
+
+	// The same file as before -- the list read again under the row, or the row
+	// back where it was -- keeps its picture, or the request already made for
+	// it, rather than being emptied and loaded again.
+	if (!found || !path || !row->thumb_path[0] || strcmp(path, row->thumb_path) != 0) {
+		row_drop_thumb(p, row);
+	}
+	row->index = index;
+
+	if (!found) {
+		// Past the end, or the handle went stale under the list, or the row is
+		// gone. Hiding the row is what a reload will fix; drawing a neighbour's
+		// name would not look like a fault at all.
+		lv_obj_set_hidden(row->button, true);
 		return;
 	}
 
-	lv_obj_remove_flag(row->button, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(row->button, false);
 	lv_obj_set_y(row->button, index * ROW_PITCH);
 	// An album row is named by its value -- name and key, see library.h -- and
 	// only the name is for reading.
@@ -1381,10 +1459,14 @@ static void row_bind(panel_t *p, row_t *row, int index) {
 	// Artists, Albums and Genres in turn: only the bind knows which list is
 	// loaded right now.
 	if (panel_shows_icons(p)) {
-		lv_obj_remove_flag(row->icon, LV_OBJ_FLAG_HIDDEN);
-		row_show_glyph(p, row);
+		lv_obj_set_hidden(row->icon, false);
+		if (row->has_thumb) {
+			row_show_cover(row, &row->thumb.dsc);
+		} else {
+			row_show_glyph(p, row);
+		}
 	} else {
-		lv_obj_add_flag(row->icon, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(row->icon, true);
 	}
 	row_update_playmark(p, row);
 	row_update_detail(p, row, index, path);
@@ -1409,7 +1491,17 @@ static void thumbs_update(panel_t *p) {
 		}
 
 		const char *source = NULL;
-		if (!row_at(p, row->index, NULL, &source) || !source) {
+		if (!row_at(p, row->index, NULL, &source)) {
+			// The list went stale under the row: the next window_update() reads
+			// it again and binds the row anew. Not "no artwork".
+			if (!p->from_paths && library_index_stale(p->ix)) {
+				anything_pending = true;
+				continue;
+			}
+			row->thumb_settled = true;
+			continue;
+		}
+		if (!source) {
 			row->thumb_settled = true; // nothing to load art from
 			continue;
 		}
@@ -1417,6 +1509,7 @@ static void thumbs_update(panel_t *p) {
 		if (!row->thumb_requested) {
 			coverloader_request(row_slot(p, row), source, THUMB_SIZE);
 			row->thumb_requested = true;
+			snprintf(row->thumb_path, sizeof(row->thumb_path), "%s", source);
 		}
 
 		bool finished = false;
@@ -1445,11 +1538,14 @@ static void thumb_timer_cb(lv_timer_t *timer) {
 	// left out of this list asks the worker for its jackets and has nobody to
 	// collect them, so its covers only appear when something else calls
 	// window_update() by hand.
+	//
+	// window_update() rather than thumbs_update() alone, so a list that went
+	// stale while its covers were loading is read again and finishes them.
 	panel_t *const panels[] = {&panel_names, &panel_tracks, &panel_artist_albums};
 	lv_obj_t *active = lv_screen_active();
 	for (size_t i = 0; i < sizeof(panels) / sizeof(panels[0]); i++) {
 		if (active == panels[i]->screen) {
-			thumbs_update(panels[i]);
+			window_update(panels[i]);
 			return;
 		}
 	}
@@ -1493,6 +1589,17 @@ static void window_update(panel_t *p) {
 	panel_refresh_playmarks(p);
 
 	thumbs_update(p);
+}
+
+void medialist_refresh_visible(void) {
+	panel_t *const panels[] = {&panel_names, &panel_tracks, &panel_artist_albums};
+	lv_obj_t *active = lv_screen_active();
+	for (size_t i = 0; i < sizeof(panels) / sizeof(panels[0]); i++) {
+		if (panels[i]->rows[0].button && active == panels[i]->screen) {
+			window_update(panels[i]);
+			return;
+		}
+	}
 }
 
 // Every row of every panel bound again, for a setting that changes what a row
@@ -1593,7 +1700,7 @@ static void model_remove(panel_t *p, int index) {
 
 	lv_obj_set_height(p->body, p->count ? p->count * ROW_PITCH : ROW_PITCH);
 	if (p->count == 0) {
-		lv_obj_remove_flag(p->empty, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(p->empty, false);
 	}
 	window_update(p);
 }
@@ -1612,10 +1719,10 @@ static void index_show_bar(panel_t *p, bool shown) {
 		return;
 	}
 	if (shown) {
-		lv_obj_remove_flag(p->index_bar, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(p->index_bar, false);
 		lv_obj_move_foreground(p->index_bar);
 	} else {
-		lv_obj_add_flag(p->index_bar, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(p->index_bar, true);
 	}
 }
 
@@ -1626,7 +1733,7 @@ static void index_flash(panel_t *p) {
 		return;
 	}
 	p->index_wanted_at = lv_tick_get();
-	if (p->index_bar && lv_obj_has_flag(p->index_bar, LV_OBJ_FLAG_HIDDEN)) {
+	if (p->index_bar && lv_obj_is_hidden(p->index_bar)) {
 		index_show_bar(p, true);
 	}
 }
@@ -1637,7 +1744,7 @@ static void index_hint_show(panel_t *p, int slot) {
 	}
 	int bucket = p->index_desc ? INDEX_BUCKETS - 1 - slot : slot;
 	lv_label_set_text(p->index_hint_label, INDEX_TEXT[bucket]);
-	lv_obj_remove_flag(p->index_hint, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(p->index_hint, false);
 	lv_obj_move_foreground(p->index_hint);
 	p->index_hint_at = lv_tick_get();
 }
@@ -1654,7 +1761,7 @@ static void index_rebuild(panel_t *p, bool enabled, bool descending) {
 
 	index_show_bar(p, false);
 	if (p->index_hint) {
-		lv_obj_add_flag(p->index_hint, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(p->index_hint, true);
 	}
 
 	if (!p->index_enabled) {
@@ -1907,13 +2014,11 @@ static void index_tick(panel_t *p) {
 	if (!index_guard_ok(p)) {
 		return;
 	}
-	if (p->index_bar && !lv_obj_has_flag(p->index_bar, LV_OBJ_FLAG_HIDDEN) &&
-		lv_tick_elaps(p->index_wanted_at) > INDEX_HIDE_MS) {
+	if (p->index_bar && !lv_obj_is_hidden(p->index_bar) && lv_tick_elaps(p->index_wanted_at) > INDEX_HIDE_MS) {
 		index_show_bar(p, false);
 	}
-	if (p->index_hint && !lv_obj_has_flag(p->index_hint, LV_OBJ_FLAG_HIDDEN) &&
-		lv_tick_elaps(p->index_hint_at) > INDEX_HINT_MS) {
-		lv_obj_add_flag(p->index_hint, LV_OBJ_FLAG_HIDDEN);
+	if (p->index_hint && !lv_obj_is_hidden(p->index_hint) && lv_tick_elaps(p->index_hint_at) > INDEX_HINT_MS) {
+		lv_obj_set_hidden(p->index_hint, true);
 	}
 }
 
@@ -1948,14 +2053,21 @@ static void reorder_icon_paint(panel_t *p) {
 // Whether this panel's list runs by date rather than by name.
 static bool sort_by_date(const panel_t *p) { return sort_can_date(p->kind, p->filter) && sort_is_added(p->kind); }
 
-// The sort button's glyph says how the list runs now: by name or by date, and
-// which way. The arrow points the way the list reads in both.
+// Whether it runs by release year.
+static bool sort_by_year(const panel_t *p) { return sort_can_year(p->kind, p->filter) && sort_is_year(p->kind); }
+
+// The sort button's glyph says how the list runs now: by name, by date or by
+// year, and which way. By name and by date the arrow points the way the list
+// reads; the year glyphs have theirs the other way round, down for the years
+// going up.
 static void sort_icon_paint(panel_t *p) {
 	if (!p->sort_icon) {
 		return;
 	}
 	bool desc = sort_is_desc(p->kind);
-	if (sort_by_date(p)) {
+	if (sort_by_year(p)) {
+		lv_image_set_src(p->sort_icon, desc ? &icon_sort_year_desc : &icon_sort_year_asc);
+	} else if (sort_by_date(p)) {
 		lv_image_set_src(p->sort_icon, desc ? &icon_sort_date_new : &icon_sort_date_old);
 	} else {
 		lv_image_set_src(p->sort_icon, desc ? &icon_sort_za : &icon_sort_az);
@@ -1989,8 +2101,8 @@ static void index_build(panel_t *p, gui_config_t *cfg) {
 	lv_obj_set_style_bg_color(p->index_bar, theme()->surface, 0);
 	lv_obj_set_style_bg_opa(p->index_bar, LV_OPA_60, 0);
 	lv_obj_set_style_radius(p->index_bar, INDEX_BAR_WIDTH / 2, 0);
-	lv_obj_remove_flag(p->index_bar, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_add_flag(p->index_bar, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_scrollable(p->index_bar, false);
+	lv_obj_set_hidden(p->index_bar, true);
 	lv_obj_set_flex_flow(p->index_bar, LV_FLEX_FLOW_COLUMN);
 	lv_obj_set_flex_align(p->index_bar, LV_FLEX_ALIGN_SPACE_AROUND, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
@@ -1998,7 +2110,7 @@ static void index_build(panel_t *p, gui_config_t *cfg) {
 	// -- but it is still part of the page, so the swipe back and the pull that
 	// brings the player in start on it as well. Which of the three a press is
 	// gets decided in index_bar_cb, from the direction it moves.
-	lv_obj_add_flag(p->index_bar, LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_set_clickable(p->index_bar, true);
 	lv_obj_add_event_cb(p->index_bar, index_bar_cb, LV_EVENT_PRESSED, p);
 	lv_obj_add_event_cb(p->index_bar, index_bar_cb, LV_EVENT_PRESSING, p);
 	lv_obj_add_event_cb(p->index_bar, index_bar_cb, LV_EVENT_RELEASED, p);
@@ -2013,7 +2125,7 @@ static void index_build(panel_t *p, gui_config_t *cfg) {
 		lv_obj_set_style_text_font(p->index_letters[i], &font_ui_14, 0);
 		// The presses belong to the strip as a whole: the letter under the
 		// finger comes from where it is, not from which label it landed on.
-		lv_obj_remove_flag(p->index_letters[i], LV_OBJ_FLAG_CLICKABLE);
+		lv_obj_set_clickable(p->index_letters[i], false);
 	}
 
 	// The letter under the finger, in the middle of the screen where the hand
@@ -2026,9 +2138,9 @@ static void index_build(panel_t *p, gui_config_t *cfg) {
 	lv_obj_set_style_bg_color(p->index_hint, theme()->accent, 0);
 	lv_obj_set_style_bg_opa(p->index_hint, LV_OPA_90, 0);
 	lv_obj_set_style_radius(p->index_hint, 26, 0);
-	lv_obj_remove_flag(p->index_hint, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_remove_flag(p->index_hint, LV_OBJ_FLAG_CLICKABLE);
-	lv_obj_add_flag(p->index_hint, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_scrollable(p->index_hint, false);
+	lv_obj_set_clickable(p->index_hint, false);
+	lv_obj_set_hidden(p->index_hint, true);
 
 	p->index_hint_label = lv_label_create(p->index_hint);
 	lv_label_set_text(p->index_hint_label, "");
@@ -2124,17 +2236,16 @@ static void row_clicked_cb(lv_event_t *e) {
 		bool queued = false;
 		if (!p->from_paths) {
 			// The same refresh menu_tracks_open() does, and for the same reason:
-			// a clone of a stale handle is stale too, the queue cannot read the
-			// path of the row it was told to start on, and it falls back to the
-			// first entry of the list. On a playlist the handle is stale almost
-			// always -- opening one starts a background pass over its files that
-			// bumps the generation.
+			// a clone of a stale handle is stale too, and the queue cannot read
+			// the path of the row it was told to start on. The rows are bound
+			// again with it, so the list the player sheet slides back over is
+			// the one the handle holds.
 			//
 			// It also keeps the reopen off the audio thread's back: done here,
 			// the index is current before playback is asked for, instead of
 			// being rebuilt inside playlist_current_path() while the playback
 			// thread is trying to take the Bluetooth transport again.
-			panel_refresh_stale(p);
+			window_update(p);
 			if (index >= p->count) {
 				return; // the list got shorter under the finger
 			}
@@ -2165,10 +2276,12 @@ static void row_clicked_cb(lv_event_t *e) {
 		return;
 	}
 
-	// An artist: their records, or their tracks when the album view is off.
-	// An album, a genre: the tracks either way.
-	bool by_artist = p->kind == LIBRARY_LIST_ARTISTS || p->kind == LIBRARY_LIST_ALBUM_ARTISTS;
-	if (by_artist && medialist_album_view()) {
+	// An artist or a genre: its records, or its tracks when the album view is
+	// off. An album: the tracks.
+	bool grouped = p->kind == LIBRARY_LIST_ARTISTS || p->kind == LIBRARY_LIST_ALBUM_ARTISTS ||
+				   p->kind == LIBRARY_LIST_GENRES;
+	bool artist_row = p->kind == LIBRARY_LIST_ARTISTS || p->kind == LIBRARY_LIST_ALBUM_ARTISTS;
+	if (grouped && (medialist_album_view() || (artist_row && artist_records))) {
 		medialist_open(name, LIBRARY_LIST_ALBUMS, filter_for(p->kind), name);
 		return;
 	}
@@ -2183,7 +2296,7 @@ static lv_obj_t *corner_button(lv_obj_t *parent, const lv_image_dsc_t *glyph, lv
 	lv_obj_set_style_border_width(btn, 0, 0);
 	lv_obj_set_style_shadow_width(btn, 0, 0);
 	lv_obj_set_style_pad_all(btn, 0, 0);
-	lv_obj_add_flag(btn, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(btn, true);
 	lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, p);
 
 	lv_obj_t *image = lv_image_create(btn);
@@ -2243,9 +2356,9 @@ static void row_apply_reorder_look(const panel_t *p, const row_t *row) {
 		lv_image_set_src(glyph, p->reordering ? &icon_grip : &icon_ellipsis_vertical);
 	}
 	if (p->reordering) {
-		lv_obj_remove_flag(row->menu_btn, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
+		lv_obj_set_scroll_chain_ver(row->menu_btn, false);
 	} else {
-		lv_obj_add_flag(row->menu_btn, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
+		lv_obj_set_scroll_chain_ver(row->menu_btn, true);
 	}
 }
 
@@ -2254,9 +2367,9 @@ static void row_apply_reorder_look(const panel_t *p, const row_t *row) {
 static void drop_line_show(panel_t *p, int before_index) {
 	if (!drop_line) {
 		drop_line = lv_obj_create(p->body);
-		lv_obj_add_flag(drop_line, LV_OBJ_FLAG_IGNORE_LAYOUT);
-		lv_obj_remove_flag(drop_line, LV_OBJ_FLAG_SCROLLABLE);
-		lv_obj_remove_flag(drop_line, LV_OBJ_FLAG_CLICKABLE);
+		lv_obj_set_ignore_layout(drop_line, true);
+		lv_obj_set_scrollable(drop_line, false);
+		lv_obj_set_clickable(drop_line, false);
 		lv_obj_set_style_border_width(drop_line, 0, 0);
 		lv_obj_set_style_shadow_width(drop_line, 0, 0);
 		lv_obj_set_style_pad_all(drop_line, 0, 0);
@@ -2267,13 +2380,13 @@ static void drop_line_show(panel_t *p, int before_index) {
 	}
 	lv_obj_set_size(drop_line, lv_obj_get_width(p->body) - 2 * ROW_PAD, 4);
 	lv_obj_set_pos(drop_line, ROW_PAD, before_index * ROW_PITCH - ROW_GAP / 2 - 2);
-	lv_obj_remove_flag(drop_line, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(drop_line, false);
 	lv_obj_move_foreground(drop_line);
 }
 
 static void drop_line_hide(void) {
 	if (drop_line) {
-		lv_obj_add_flag(drop_line, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(drop_line, true);
 	}
 }
 
@@ -2453,6 +2566,11 @@ static void screen_unloaded_cb(lv_event_t *e) {
 	selection_stop(lv_event_get_user_data(e));
 }
 
+// Set while a list is reopened under a new ordering: it comes back at the top,
+// not on what is playing. A new order is something to read from the start of;
+// the next time the list is entered, it opens on the current track again.
+static bool reopening_resorted;
+
 // Reopens whatever this panel is showing, under whatever the ordering now is.
 // The signature is cleared first so the list comes back at the top: after a
 // re-sort the old scroll position points at nothing in particular.
@@ -2466,16 +2584,22 @@ static void reload_current(panel_t *p) {
 	snprintf(value, sizeof(value), "%s", p->filter_value);
 
 	p->signature[0] = '\0';
+	reopening_resorted = true;
 	medialist_open(title, p->kind, p->filter, value[0] ? value : NULL);
+	reopening_resorted = false;
 }
 
-// The four ways a datable list can run, as the menu offers them. Each is a
-// pair of bits, and the menu's tick is whichever pair is set now.
+// The ways a datable list can run, as the menu offers them -- the last two only
+// on the lists that have a year. Each is a set of bits, and the menu's tick is
+// whichever set is on now.
 typedef enum {
 	SORT_NAME_AZ,
 	SORT_NAME_ZA,
 	SORT_ADDED_NEW,
 	SORT_ADDED_OLD,
+	SORT_YEAR_UP,
+	SORT_YEAR_DOWN,
+	SORT_CHOICES,
 } sort_choice_t;
 
 static panel_t *sort_menu_panel;
@@ -2487,7 +2611,8 @@ static void sort_picked(void *user) {
 	}
 	sort_choice_t choice = (sort_choice_t)(intptr_t)user;
 	sort_set_added(p->kind, choice == SORT_ADDED_NEW || choice == SORT_ADDED_OLD);
-	sort_set_desc(p->kind, choice == SORT_NAME_ZA || choice == SORT_ADDED_NEW);
+	sort_set_year(p->kind, choice == SORT_YEAR_UP || choice == SORT_YEAR_DOWN);
+	sort_set_desc(p->kind, choice == SORT_NAME_ZA || choice == SORT_ADDED_NEW || choice == SORT_YEAR_DOWN);
 	reload_current(p);
 }
 
@@ -2504,22 +2629,26 @@ static void sort_clicked_cb(lv_event_t *e) {
 		return;
 	}
 
-	bool added = sort_is_added(p->kind);
 	bool desc = sort_is_desc(p->kind);
-	sort_choice_t current = added ? (desc ? SORT_ADDED_NEW : SORT_ADDED_OLD) : (desc ? SORT_NAME_ZA : SORT_NAME_AZ);
+	sort_choice_t current = desc ? SORT_NAME_ZA : SORT_NAME_AZ;
+	if (sort_by_year(p)) {
+		current = desc ? SORT_YEAR_DOWN : SORT_YEAR_UP;
+	} else if (sort_by_date(p)) {
+		current = desc ? SORT_ADDED_NEW : SORT_ADDED_OLD;
+	}
 
-	static const char *const labels[] = {
-		[SORT_NAME_AZ] = "medialist_sort_name_az",
-		[SORT_NAME_ZA] = "medialist_sort_name_za",
-		[SORT_ADDED_NEW] = "medialist_sort_added_new",
-		[SORT_ADDED_OLD] = "medialist_sort_added_old",
+	static const char *const labels[SORT_CHOICES] = {
+		[SORT_NAME_AZ] = "medialist_sort_name_az",	   [SORT_NAME_ZA] = "medialist_sort_name_za",
+		[SORT_ADDED_NEW] = "medialist_sort_added_new", [SORT_ADDED_OLD] = "medialist_sort_added_old",
+		[SORT_YEAR_UP] = "medialist_sort_year_up",	   [SORT_YEAR_DOWN] = "medialist_sort_year_down",
 	};
-	popover_item_t items[4];
-	for (int i = 0; i < 4; i++) {
+	int n = sort_can_year(p->kind, p->filter) ? SORT_CHOICES : SORT_YEAR_UP;
+	popover_item_t items[SORT_CHOICES];
+	for (int i = 0; i < n; i++) {
 		items[i] = (popover_item_t){labels[i], sort_picked, (void *)(intptr_t)i, i == (int)current};
 	}
 	sort_menu_panel = p;
-	popover_show(lv_event_get_current_target(e), items, 4);
+	popover_show(lv_event_get_current_target(e), items, n);
 }
 
 // Favourites reversed: the most recently starred track on top. The database
@@ -2538,15 +2667,35 @@ static void reverse_clicked_cb(lv_event_t *e) {
 	reload_current(p);
 }
 
+// Set while the disc button swaps an artist's tracks for their records or back:
+// the new page takes the old one's place instead of going on top of it, so the
+// way back leads to wherever the artist was opened from.
+static bool open_replacing;
+
 static void album_order_clicked_cb(lv_event_t *e) {
 	panel_t *p = lv_event_get_user_data(e);
-	if (!p) {
+	if (!p || p->from_paths) {
 		return;
 	}
-	artist_album_order = !artist_album_order;
-	config_set_int("library", "artist_album_order", artist_album_order ? 1 : 0);
+	bool to_records = p->kind == LIBRARY_LIST_TRACKS;
+	artist_records = to_records;
+	config_set_int("library", "artist_records", artist_records ? 1 : 0);
 	config_save();
-	reload_current(p);
+
+	char title[sizeof(p->title)];
+	char value[sizeof(p->filter_value)];
+	snprintf(title, sizeof(title), "%s", p->title);
+	snprintf(value, sizeof(value), "%s", p->filter_value);
+	open_replacing = true;
+	medialist_open(title, to_records ? LIBRARY_LIST_ALBUMS : LIBRARY_LIST_TRACKS, p->filter, value);
+	open_replacing = false;
+}
+
+void medialist_open_artist(const char *name) {
+	if (!name || !name[0]) {
+		return;
+	}
+	medialist_open(name, artist_records ? LIBRARY_LIST_ALBUMS : LIBRARY_LIST_TRACKS, LIBRARY_FILTER_ARTIST, name);
 }
 
 // Copies the path of the one row a window was asked for.
@@ -2580,7 +2729,7 @@ static panel_t *play_menu_panel;
 
 static void play_menu_hide(void) {
 	if (play_menu_panel && play_menu_panel->play_menu) {
-		lv_obj_add_flag(play_menu_panel->play_menu, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(play_menu_panel->play_menu, true);
 	}
 	play_menu_panel = NULL;
 }
@@ -2609,14 +2758,10 @@ static library_index_t *menu_tracks_open(panel_t *p) {
 
 	// The handle the queue is about to be built from has to be the current one.
 	// Row ids are only a promise, and a stale handle hands out a clone that is
-	// stale too: library_index_window() refuses it, the queue cannot read the
-	// path of the track it was told to start on, and it falls back to entry 0.
-	//
-	// This is not a theoretical window: opening a playlist starts a background
-	// pass that checks whether its files are still on the card, and that pass
-	// bumps the playlist generation a fraction of a second after the page
-	// appears, so the page is stale almost immediately, every time.
-	panel_refresh_stale(p);
+	// stale too: library_index_window() refuses it and the queue cannot read the
+	// path of the track it was told to start on. The rows are bound again with
+	// it.
+	window_update(p);
 
 	library_index_t *ix = NULL;
 	if (p->kind == LIBRARY_LIST_TRACKS || p->kind == LIBRARY_LIST_FAVOURITES || p->kind == LIBRARY_LIST_PLAYLIST) {
@@ -2780,7 +2925,7 @@ static lv_obj_t *play_menu_row(lv_obj_t *parent, const char *text, lv_event_cb_t
 	lv_obj_set_style_border_width(row, 0, 0);
 	lv_obj_set_style_shadow_width(row, 0, 0);
 	lv_obj_set_style_pad_hor(row, 16, 0);
-	lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_set_scrollable(row, false);
 	lv_obj_add_event_cb(row, cb, LV_EVENT_CLICKED, NULL);
 
 	lv_obj_t *label = lv_label_create(row);
@@ -2802,9 +2947,9 @@ static void play_menu_build(panel_t *p) {
 	lv_obj_set_size(p->play_menu, lv_pct(100), lv_pct(100));
 	lv_obj_set_style_bg_color(p->play_menu, lv_color_black(), 0);
 	lv_obj_set_style_bg_opa(p->play_menu, LV_OPA_60, 0);
-	lv_obj_add_flag(p->play_menu, LV_OBJ_FLAG_CLICKABLE);
-	lv_obj_remove_flag(p->play_menu, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_add_flag(p->play_menu, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_clickable(p->play_menu, true);
+	lv_obj_set_scrollable(p->play_menu, false);
+	lv_obj_set_hidden(p->play_menu, true);
 	lv_obj_add_event_cb(p->play_menu, play_menu_dismiss_cb, LV_EVENT_CLICKED, NULL);
 
 	lv_obj_t *card = lv_obj_create(p->play_menu);
@@ -2817,7 +2962,7 @@ static void play_menu_build(panel_t *p) {
 	lv_obj_set_style_shadow_width(card, 0, 0);
 	lv_obj_set_style_pad_all(card, 16, 0);
 	lv_obj_set_style_pad_gap(card, 10, 0);
-	lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_set_scrollable(card, false);
 	lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
 	lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
@@ -2835,7 +2980,7 @@ static void play_menu_clicked_cb(lv_event_t *e) {
 		play_menu_build(p);
 	}
 	play_menu_panel = p;
-	lv_obj_remove_flag(p->play_menu, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(p->play_menu, false);
 	lv_obj_move_foreground(p->play_menu);
 }
 
@@ -3080,10 +3225,10 @@ static void build_panel(panel_t *p, gui_config_t *cfg, bool is_tracks, int slot_
 	lv_obj_set_style_bg_opa(p->body, 0, 0);
 	lv_obj_set_style_border_width(p->body, 0, 0);
 	lv_obj_set_style_pad_all(p->body, 0, 0);
-	lv_obj_remove_flag(p->body, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_set_scrollable(p->body, false);
 	// Row presses bubble row -> body -> list; without this flag they stop here
 	// and the swipe gestures never see a press that began on a row.
-	lv_obj_add_flag(p->body, LV_OBJ_FLAG_EVENT_BUBBLE);
+	lv_obj_set_event_bubble(p->body, true);
 
 	// The corner strip, on the title row's right: whichever of the three
 	// buttons this particular list has a use for. A row rather than three
@@ -3098,9 +3243,9 @@ static void build_panel(panel_t *p, gui_config_t *cfg, bool is_tracks, int slot_
 	// parent, at x = -60, and is never drawn. Sizing for the most buttons that
 	// can coexist costs a strip of empty space on the pages that show fewer.
 	lv_obj_set_size(p->corner, CORNER_MAX_BUTTONS * CORNER_BUTTON_SIZE + (CORNER_MAX_BUTTONS - 1) * CORNER_GAP, 56);
-	lv_obj_remove_flag(p->corner, LV_OBJ_FLAG_CLICKABLE); // it is a shelf, not a control
+	lv_obj_set_clickable(p->corner, false); // it is a shelf, not a control
 	lv_obj_align(p->corner, LV_ALIGN_TOP_RIGHT, -cfg->padding, cfg->padding + cfg->top_bar_height);
-	lv_obj_remove_flag(p->corner, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_set_scrollable(p->corner, false);
 	lv_obj_set_flex_flow(p->corner, LV_FLEX_FLOW_ROW);
 	lv_obj_set_flex_align(p->corner, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 	lv_obj_set_style_pad_column(p->corner, CORNER_GAP, 0);
@@ -3145,10 +3290,10 @@ static void build_panel(panel_t *p, gui_config_t *cfg, bool is_tracks, int slot_
 	p->sel_unfav_btn = corner_button(p->corner, &icon_star_x, sel_unfav_cb, p);
 	p->sel_unlist_btn = corner_button(p->corner, &icon_list_x, sel_unlist_cb, p);
 	p->sel_close_btn = corner_button(p->corner, &icon_close, sel_close_cb, p);
-	lv_obj_add_flag(p->sel_queue_btn, LV_OBJ_FLAG_HIDDEN);
-	lv_obj_add_flag(p->sel_fav_btn, LV_OBJ_FLAG_HIDDEN);
-	lv_obj_add_flag(p->sel_add_btn, LV_OBJ_FLAG_HIDDEN);
-	lv_obj_add_flag(p->sel_close_btn, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(p->sel_queue_btn, true);
+	lv_obj_set_hidden(p->sel_fav_btn, true);
+	lv_obj_set_hidden(p->sel_add_btn, true);
+	lv_obj_set_hidden(p->sel_close_btn, true);
 
 	p->empty = lv_label_create(p->list);
 	lv_label_set_text(p->empty, tr("library_empty_note"));
@@ -3156,7 +3301,7 @@ static void build_panel(panel_t *p, gui_config_t *cfg, bool is_tracks, int slot_
 	lv_obj_add_style(p->empty, &theme_style_text_dim, 0);
 	lv_obj_set_style_text_font(p->empty, &font_ui_24, 0);
 	lv_obj_align(p->empty, LV_ALIGN_TOP_MID, 0, 120);
-	lv_obj_add_flag(p->empty, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(p->empty, true);
 
 	for (int i = 0; i < ROW_POOL; i++) {
 		row_t *row = &p->rows[i];
@@ -3167,8 +3312,8 @@ static void build_panel(panel_t *p, gui_config_t *cfg, bool is_tracks, int slot_
 		lv_obj_add_style(row->button, &theme_style_card, 0);
 		lv_obj_add_style(row->button, &style_row, 0);
 		lv_obj_add_style(row->button, &theme_style_card_pressed, LV_STATE_PRESSED);
-		lv_obj_add_flag(row->button, LV_OBJ_FLAG_HIDDEN);
-		lv_obj_add_flag(row->button, LV_OBJ_FLAG_EVENT_BUBBLE); // so the player sheet can be dragged in
+		lv_obj_set_hidden(row->button, true);
+		lv_obj_set_event_bubble(row->button, true); // so the player sheet can be dragged in
 		lv_obj_add_event_cb(row->button, row_clicked_cb, LV_EVENT_CLICKED, p);
 		lv_obj_add_event_cb(row->button, row_long_pressed_cb, LV_EVENT_LONG_PRESSED, p);
 
@@ -3189,9 +3334,9 @@ static void build_panel(panel_t *p, gui_config_t *cfg, bool is_tracks, int slot_
 		lv_obj_set_flex_flow(row->text, LV_FLEX_FLOW_COLUMN);
 		lv_obj_set_flex_align(row->text, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 		lv_obj_set_style_pad_row(row->text, QUALITY_GAP, 0);
-		lv_obj_remove_flag(row->text, LV_OBJ_FLAG_SCROLLABLE);
-		lv_obj_remove_flag(row->text, LV_OBJ_FLAG_CLICKABLE);
-		lv_obj_add_flag(row->text, LV_OBJ_FLAG_EVENT_BUBBLE);
+		lv_obj_set_scrollable(row->text, false);
+		lv_obj_set_clickable(row->text, false);
+		lv_obj_set_event_bubble(row->text, true);
 
 		row->label = lv_label_create(row->text);
 		lv_label_set_long_mode(row->label, LV_LABEL_LONG_DOT);
@@ -3208,18 +3353,18 @@ static void build_panel(panel_t *p, gui_config_t *cfg, bool is_tracks, int slot_
 		lv_obj_set_flex_flow(row->detail, LV_FLEX_FLOW_ROW);
 		lv_obj_set_flex_align(row->detail, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 		lv_obj_set_style_pad_column(row->detail, 8, 0);
-		lv_obj_remove_flag(row->detail, LV_OBJ_FLAG_SCROLLABLE);
-		lv_obj_remove_flag(row->detail, LV_OBJ_FLAG_CLICKABLE);
-		lv_obj_add_flag(row->detail, LV_OBJ_FLAG_EVENT_BUBBLE);
-		lv_obj_add_flag(row->detail, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_scrollable(row->detail, false);
+		lv_obj_set_clickable(row->detail, false);
+		lv_obj_set_event_bubble(row->detail, true);
+		lv_obj_set_hidden(row->detail, true);
 
 		// Only track rows have a quality to show: an album or an artist is not
 		// one recording.
 		row->quality = NULL;
 		if (is_tracks) {
 			row->quality = lv_image_create(row->detail);
-			lv_obj_add_flag(row->quality, LV_OBJ_FLAG_HIDDEN);
-			lv_obj_remove_flag(row->quality, LV_OBJ_FLAG_CLICKABLE);
+			lv_obj_set_hidden(row->quality, true);
+			lv_obj_set_clickable(row->quality, false);
 		}
 
 		// One line like the title, cut with dots, in the quieter colour.
@@ -3230,13 +3375,13 @@ static void build_panel(panel_t *p, gui_config_t *cfg, bool is_tracks, int slot_
 		lv_obj_set_height(row->artist, lv_font_get_line_height(&font_ui_20));
 		lv_obj_add_style(row->artist, &theme_style_text_dim, 0);
 		lv_obj_set_style_text_font(row->artist, &font_ui_20, 0);
-		lv_obj_add_flag(row->artist, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(row->artist, true);
 
 		// Out of the flex layout on purpose: it sits in the row's own left
 		// padding, so adding it moves nothing. Hidden until a row it belongs
 		// to is bound.
 		row->playmark = lv_obj_create(row->button);
-		lv_obj_add_flag(row->playmark, LV_OBJ_FLAG_IGNORE_LAYOUT);
+		lv_obj_set_ignore_layout(row->playmark, true);
 		lv_obj_set_size(row->playmark, PLAYMARK_WIDTH, PLAYMARK_HEIGHT);
 		lv_obj_align(row->playmark, LV_ALIGN_LEFT_MID, PLAYMARK_INSET - ROW_PAD, 0);
 		lv_obj_add_style(row->playmark, &theme_style_accent_bg, 0);
@@ -3244,9 +3389,9 @@ static void build_panel(panel_t *p, gui_config_t *cfg, bool is_tracks, int slot_
 		lv_obj_set_style_border_width(row->playmark, 0, 0);
 		lv_obj_set_style_shadow_width(row->playmark, 0, 0);
 		lv_obj_set_style_pad_all(row->playmark, 0, 0);
-		lv_obj_remove_flag(row->playmark, LV_OBJ_FLAG_SCROLLABLE);
-		lv_obj_remove_flag(row->playmark, LV_OBJ_FLAG_CLICKABLE);
-		lv_obj_add_flag(row->playmark, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_scrollable(row->playmark, false);
+		lv_obj_set_clickable(row->playmark, false);
+		lv_obj_set_hidden(row->playmark, true);
 
 		row->menu_btn = NULL;
 		row->chevron = NULL;
@@ -3289,8 +3434,8 @@ static void build_panel(panel_t *p, gui_config_t *cfg, bool is_tracks, int slot_
 		lv_image_set_src(row->check, &icon_check);
 		lv_obj_add_style(row->check, &theme_style_icon, 0);
 		lv_obj_set_style_image_recolor_opa(row->check, LV_OPA_COVER, 0);
-		lv_obj_remove_flag(row->check, LV_OBJ_FLAG_CLICKABLE);
-		lv_obj_add_flag(row->check, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_clickable(row->check, false);
+		lv_obj_set_hidden(row->check, true);
 
 		row->index = -1;
 		row->has_thumb = false;
@@ -3322,9 +3467,41 @@ static void show_corner(lv_obj_t *btn, bool shown) {
 		return;
 	}
 	if (shown) {
-		lv_obj_remove_flag(btn, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(btn, false);
 	} else {
-		lv_obj_add_flag(btn, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(btn, true);
+	}
+}
+
+// The row of the list `p` has just loaded that "Go to the current track" opens
+// on: the playing track in All tracks, and in the four name lists whatever it
+// belongs to -- its record, its artist, its album artist, its genre. -1 when
+// the option is off, the list is not one of those five, or nothing in it is
+// playing.
+static int current_row(panel_t *p) {
+	if (!medialist_go_to_current() || !p->ix || reopening_resorted) {
+		return -1;
+	}
+	np_cache_refresh();
+	if (!np_path[0]) {
+		return -1;
+	}
+	switch (p->kind) {
+	case LIBRARY_LIST_TRACKS:
+		return p->filter == LIBRARY_FILTER_NONE ? library_index_find_path(p->ix, np_path) : -1;
+	case LIBRARY_LIST_ALBUMS:
+		if (p->filter != LIBRARY_FILTER_NONE) {
+			return -1;
+		}
+		return library_index_find_name(p->ix, np_album_value[0] ? np_album_value : np_album);
+	case LIBRARY_LIST_ARTISTS:
+		return library_index_find_name(p->ix, np_artist);
+	case LIBRARY_LIST_ALBUM_ARTISTS:
+		return library_index_find_name(p->ix, np_album_artist);
+	case LIBRARY_LIST_GENRES:
+		return library_index_find_name(p->ix, np_genre);
+	default:
+		return -1;
 	}
 }
 
@@ -3339,12 +3516,12 @@ void medialist_open(const char *title, library_list_t kind, library_filter_t fil
 	}
 
 	// Which of the three screens this list belongs on. Tracks are always the
-	// last level; an album list narrowed to one artist is the middle one;
-	// everything else is where a walk starts.
+	// last level; an album list narrowed to one artist or genre is the middle
+	// one; everything else is where a walk starts.
 	bool tracks_like =
 		(kind == LIBRARY_LIST_TRACKS || kind == LIBRARY_LIST_FAVOURITES || kind == LIBRARY_LIST_PLAYLIST);
-	bool artist_albums = kind == LIBRARY_LIST_ALBUMS &&
-						 (filter == LIBRARY_FILTER_ARTIST || filter == LIBRARY_FILTER_ALBUM_ARTIST);
+	bool artist_albums = kind == LIBRARY_LIST_ALBUMS && (filter == LIBRARY_FILTER_ARTIST ||
+														 filter == LIBRARY_FILTER_ALBUM_ARTIST || filter == LIBRARY_FILTER_GENRE);
 	panel_t *p = tracks_like ? &panel_tracks : (artist_albums ? &panel_artist_albums : &panel_names);
 	p->kind = kind;
 	// A playlist is a query like any other, and the query's value is its
@@ -3378,17 +3555,18 @@ void medialist_open(const char *title, library_list_t kind, library_filter_t fil
 
 	// Which of the corner buttons this list has a use for.
 	//
-	// An artist's own track list gets the album grouping; the four flat
-	// alphabetical lists get the direction switch; Favourites gets shuffle. A
-	// list ordered by album has no alphabetical direction to invert, so the
-	// two never appear together.
+	// An artist's own tracks and records get the disc button that swaps one for
+	// the other; the four flat alphabetical lists get the direction switch;
+	// Favourites gets shuffle.
 	bool artist_tracks =
 		kind == LIBRARY_LIST_TRACKS && (filter == LIBRARY_FILTER_ARTIST || filter == LIBRARY_FILTER_ALBUM_ARTIST);
+	bool artist_records_page =
+		artist_albums && (filter == LIBRARY_FILTER_ARTIST || filter == LIBRARY_FILTER_ALBUM_ARTIST);
 	bool sortable = (kind == LIBRARY_LIST_TRACKS && filter == LIBRARY_FILTER_NONE) ||
 					(kind == LIBRARY_LIST_ALBUMS && !artist_albums) || kind == LIBRARY_LIST_ARTISTS ||
 					kind == LIBRARY_LIST_ALBUM_ARTISTS;
 
-	bool want_album = artist_tracks;
+	bool want_album = artist_tracks || artist_records_page;
 	// The circle-play menu, wherever "play all of this" is a question worth
 	// asking: an artist's records, an artist's tracks, all the records, all the
 	// tracks, the favourites, a playlist, inside one album. Not on the name lists,
@@ -3399,7 +3577,7 @@ void medialist_open(const char *title, library_list_t kind, library_filter_t fil
 					  (filter == LIBRARY_FILTER_NONE || filter == LIBRARY_FILTER_ARTIST ||
 					   filter == LIBRARY_FILTER_ALBUM_ARTIST || filter == LIBRARY_FILTER_ALBUM));
 
-	bool want_sort = sortable && !(artist_tracks && artist_album_order);
+	bool want_sort = sortable;
 	bool want_reverse = kind == LIBRARY_LIST_FAVOURITES;
 	// A playlist is the only list whose order belongs to the user. Every other
 	// one comes back from the database in an order the database decides, and
@@ -3427,17 +3605,17 @@ void medialist_open(const char *title, library_list_t kind, library_filter_t fil
 	settingsrow_title_corner_slots(p->title_label, p->cfg, corner_buttons);
 
 	if (p->album_btn) {
-		// Lit in the accent while the grouping is on: the button is a state,
-		// not an action that happens once.
+		// Lit in the accent on the records: the button is a state, not an
+		// action that happens once.
 		lv_obj_set_style_image_recolor(lv_obj_get_child(p->album_btn, 0),
-									   artist_album_order ? theme()->accent : theme()->text_primary, 0);
+									   artist_albums ? theme()->accent : theme()->text_primary, 0);
 	}
 	if (p->reverse_btn) {
 		// Lit in the accent colour for as long as the list is reversed.
 		lv_obj_set_style_image_recolor(lv_obj_get_child(p->reverse_btn, 0),
 									   fav_reversed ? theme()->accent : theme()->text_primary, 0);
 	}
-	bool by_date = sort_by_date(p);
+	bool by_date = sort_by_date(p) || sort_by_year(p);
 	sort_icon_paint(p);
 	lv_obj_move_foreground(p->corner);
 
@@ -3449,9 +3627,9 @@ void medialist_open(const char *title, library_list_t kind, library_filter_t fil
 	}
 
 	model_clear(p);
-	library_order_t order = (artist_tracks && artist_album_order) ? LIBRARY_ORDER_ALBUM
-							: by_date							   ? LIBRARY_ORDER_ADDED
-																   : LIBRARY_ORDER_DEFAULT;
+	library_order_t order = LIBRARY_ORDER_DEFAULT;
+	bool sort_desc = false;
+	sort_order_for(kind, filter, &order, &sort_desc);
 
 	// Z-A is the same list read backwards. The database has already done the
 	// hard part -- the collation groups by script, folds case and accents and
@@ -3460,7 +3638,7 @@ void medialist_open(const char *title, library_list_t kind, library_filter_t fil
 	// again. Reversed favourites are the same list read backwards as well: the
 	// database returns it oldest-starred first, and with the button on, the
 	// newest belongs on top.
-	bool desc = (sortable && sort_is_desc(kind)) || (kind == LIBRARY_LIST_FAVOURITES && fav_reversed);
+	bool desc = (sortable && sort_desc) || (kind == LIBRARY_LIST_FAVOURITES && fav_reversed);
 
 	p->from_paths = false;
 	p->list_order = order;
@@ -3470,9 +3648,9 @@ void medialist_open(const char *title, library_list_t kind, library_filter_t fil
 
 	lv_obj_set_height(p->body, p->count ? p->count * ROW_PITCH : ROW_PITCH);
 	if (p->count == 0) {
-		lv_obj_remove_flag(p->empty, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(p->empty, false);
 	} else {
-		lv_obj_add_flag(p->empty, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(p->empty, true);
 	}
 
 	// The A-Z strip, on the two long flat lists: all the tracks and all the
@@ -3486,8 +3664,17 @@ void medialist_open(const char *title, library_list_t kind, library_filter_t fil
 	index_rebuild(p, p->index_wanted, sortable && sort_is_desc(kind));
 
 	// The same list resumes at its old scroll position; a different one
-	// starts at the top.
+	// starts at the top -- unless it opens on what is playing.
 	int target_scroll = same_list ? p->saved_scroll : 0;
+	int current = current_row(p);
+	if (current >= 0) {
+		// In the middle of the screen rather than at the top, so the rows
+		// around it show where in the list it is.
+		target_scroll = current * ROW_PITCH - (lv_obj_get_height(p->list) - ROW_PITCH) / 2;
+		if (target_scroll < 0) {
+			target_scroll = 0;
+		}
+	}
 	int max_scroll = p->count * ROW_PITCH - lv_obj_get_height(p->list);
 	if (target_scroll > max_scroll) {
 		target_scroll = max_scroll > 0 ? max_scroll : 0;
@@ -3496,7 +3683,11 @@ void medialist_open(const char *title, library_list_t kind, library_filter_t fil
 	p->saved_scroll = target_scroll;
 	window_update(p);
 
-	switch_screen(p->screen);
+	if (open_replacing) {
+		switch_screen_no_history(p->screen);
+	} else {
+		switch_screen(p->screen);
+	}
 }
 
 // A track list built from paths handed in rather than queried: a playlist's
@@ -3552,9 +3743,9 @@ void medialist_open_paths(const char *title, const char *const *paths, const cha
 
 	lv_obj_set_height(p->body, p->count ? p->count * ROW_PITCH : ROW_PITCH);
 	if (p->count == 0) {
-		lv_obj_remove_flag(p->empty, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(p->empty, false);
 	} else {
-		lv_obj_add_flag(p->empty, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(p->empty, true);
 	}
 
 	// No A-Z strip on a playlist: its order is the one the user put it in.
@@ -3593,7 +3784,8 @@ void medialist_init(gui_config_t *cfg) {
 
 	sort_desc_mask = (unsigned)config_get_int("library", "sort_desc", 0);
 	sort_added_mask = (unsigned)config_get_int("library", "sort_added", 0);
-	artist_album_order = config_get_int("library", "artist_album_order", 0) != 0;
+	sort_year_mask = (unsigned)config_get_int("library", "sort_year", 0);
+	artist_records = config_get_int("library", "artist_records", 0) != 0;
 	load_view_settings();
 	fav_reversed = config_get_int("library", "fav_reversed", 0) != 0;
 
@@ -3604,6 +3796,11 @@ void medialist_init(gui_config_t *cfg) {
 	build_panel(&panel_names, cfg, false, SLOT_BASE_NAMES);
 	build_panel(&panel_tracks, cfg, true, SLOT_BASE_TRACKS);
 	build_panel(&panel_artist_albums, cfg, false, SLOT_BASE_ARTIST_ALBUMS);
+	// The records of one artist carry the disc button too, lit, to go back to
+	// the tracks; leftmost, as on the track list.
+	panel_artist_albums.album_btn =
+		corner_button(panel_artist_albums.corner, &icon_album_corner, album_order_clicked_cb, &panel_artist_albums);
+	lv_obj_move_to_index(panel_artist_albums.album_btn, 0);
 
 	thumb_timer = lv_timer_create(thumb_timer_cb, THUMB_POLL_MS, NULL);
 	lv_timer_pause(thumb_timer);
@@ -3623,34 +3820,36 @@ void medialist_init(gui_config_t *cfg) {
 // ---------------------------------------------------------------------------
 
 // The same decisions the corner buttons make in the list itself: which lists
-// can be reversed or put by date, and an artist's tracks by record.
+// can be reversed or put by date or by year.
 void medialist_list_order(library_list_t kind, library_filter_t filter, library_order_t *order, bool *desc) {
-	bool artist_tracks =
-		kind == LIBRARY_LIST_TRACKS && (filter == LIBRARY_FILTER_ARTIST || filter == LIBRARY_FILTER_ALBUM_ARTIST);
 	bool sortable = (kind == LIBRARY_LIST_TRACKS && filter == LIBRARY_FILTER_NONE) ||
 					(kind == LIBRARY_LIST_ALBUMS && filter == LIBRARY_FILTER_NONE) || kind == LIBRARY_LIST_ARTISTS ||
 					kind == LIBRARY_LIST_ALBUM_ARTISTS;
-	bool by_date = sort_can_date(kind, filter) && sort_is_added(kind);
+	library_order_t sort_order = LIBRARY_ORDER_DEFAULT;
+	bool sort_desc = false;
+	sort_order_for(kind, filter, &sort_order, &sort_desc);
 	if (order) {
-		*order = (artist_tracks && artist_album_order) ? LIBRARY_ORDER_ALBUM
-				 : by_date							   ? LIBRARY_ORDER_ADDED
-													   : LIBRARY_ORDER_DEFAULT;
+		*order = sort_order;
 	}
 	if (desc) {
-		*desc = (sortable && !(artist_tracks && artist_album_order) && sort_is_desc(kind)) ||
-				(kind == LIBRARY_LIST_FAVOURITES && fav_reversed);
+		*desc = (sortable && sort_desc) || (kind == LIBRARY_LIST_FAVOURITES && fav_reversed);
 	}
 }
 
 void medialist_sort_prefs(unsigned *desc_mask, unsigned *added_mask, bool *artist_by_album, bool *favourites_reversed) {
+	// The app knows names and dates, not years: a list the player runs by year
+	// is described to it as A-Z rather than as a direction it would apply to
+	// the names.
 	if (desc_mask) {
-		*desc_mask = sort_desc_mask;
+		*desc_mask = sort_desc_mask & ~sort_year_mask;
 	}
 	if (added_mask) {
 		*added_mask = sort_added_mask;
 	}
+	// An artist's tracks always run by title now; their records are a page of
+	// their own.
 	if (artist_by_album) {
-		*artist_by_album = artist_album_order;
+		*artist_by_album = false;
 	}
 	if (favourites_reversed) {
 		*favourites_reversed = fav_reversed;

@@ -322,8 +322,8 @@ static void add_row(lv_obj_t *parent, const bt_device_t *device, bool paired_sec
 	lv_obj_set_style_shadow_width(row, 0, 0);
 	lv_obj_set_style_pad_hor(row, 18, 0);
 	lv_obj_set_style_pad_ver(row, 0, 0);
-	lv_obj_add_flag(row, LV_OBJ_FLAG_EVENT_BUBBLE);
-	lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_set_event_bubble(row, true);
+	lv_obj_set_scrollable(row, false);
 	lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
 	lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 	lv_obj_set_style_pad_column(row, 14, 0);
@@ -393,7 +393,7 @@ static void add_placeholder(lv_obj_t *parent, const char *text, bool spin) {
 	lv_obj_set_height(row, LV_SIZE_CONTENT);
 	lv_obj_set_style_pad_top(row, 4, 0);
 	lv_obj_set_style_pad_column(row, 10, 0);
-	lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_set_scrollable(row, false);
 	lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
 	lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
@@ -413,11 +413,11 @@ static void rebuild_lists(void) {
 
 	bool on = bluetooth_get_enabled() && bluetooth_available();
 	if (!on) {
-		lv_obj_add_flag(paired_label, LV_OBJ_FLAG_HIDDEN);
-		lv_obj_add_flag(found_label, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(paired_label, true);
+		lv_obj_set_hidden(found_label, true);
 		return;
 	}
-	lv_obj_remove_flag(paired_label, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(paired_label, false);
 
 	bt_device_t devices[BT_MAX_DEVICES];
 
@@ -435,15 +435,15 @@ static void rebuild_lists(void) {
 	count = bluetooth_get_found(devices, BT_MAX_DEVICES);
 	if (count == 0) {
 		if (bluetooth_scan_running()) {
-			lv_obj_remove_flag(found_label, LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(found_label, false);
 			add_placeholder(found_list, "searching", true);
 		} else {
-			lv_obj_add_flag(found_label, LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(found_label, true);
 		}
 		return;
 	}
 
-	lv_obj_remove_flag(found_label, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(found_label, false);
 	for (int i = 0; i < count; i++) {
 		add_row(found_list, &devices[i], false);
 	}
@@ -584,6 +584,15 @@ static void poll_cb(lv_timer_t *timer) {
 	}
 }
 
+// The control centre switched the radio with the page open under it. The poll
+// already follows the radio; this only saves waiting for its next round.
+static void switched_elsewhere_cb(lv_event_t *e) {
+	(void)e;
+	if (poll_timer) {
+		lv_timer_ready(poll_timer);
+	}
+}
+
 static void screen_loaded_cb(lv_event_t *e) {
 	(void)e;
 	drawn_serial = 0xFFFFFFFFu;
@@ -648,8 +657,8 @@ static lv_obj_t *make_section(lv_obj_t *container, const char *title, lv_obj_t *
 	lv_obj_set_style_border_width(box, 0, 0);
 	lv_obj_set_style_pad_all(box, 0, 0);
 	lv_obj_set_style_pad_gap(box, 8, 0);
-	lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_add_flag(box, LV_OBJ_FLAG_EVENT_BUBBLE);
+	lv_obj_set_scrollable(box, false);
+	lv_obj_set_event_bubble(box, true);
 	lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
 	return box;
 }
@@ -695,6 +704,7 @@ void btsettings_init(gui_config_t *cfg) {
 	lv_timer_pause(poll_timer);
 
 	lv_obj_add_event_cb(btsettings_screen, screen_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
+	lv_obj_add_event_cb(btsettings_screen, switched_elsewhere_cb, LV_EVENT_REFRESH, NULL);
 	lv_obj_add_event_cb(btsettings_screen, screen_unloaded_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
 	switcher_attach_back_gesture(btsettings_screen);
 

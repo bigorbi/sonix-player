@@ -7,10 +7,10 @@
 #include "lvgl/lvgl.h"
 
 // The library index pages: one screen for name lists (albums, artists, album
-// artists, genres), one for one artist's records, and one for track lists (all
-// tracks, and the tracks of whatever was tapped). A screen each rather than one
-// reused, so the back chevron walks artists -> that artist's albums -> the
-// album's tracks and back out again the way it should.
+// artists, genres), one for one artist's or one genre's records, and one for
+// track lists (all tracks, and the tracks of whatever was tapped). A screen each
+// rather than one reused, so the back chevron walks artists -> that artist's
+// albums -> the album's tracks and back out again the way it should.
 //
 // Rows are a fixed pool windowed over the scroll position, the same technique
 // as the file browser, and the data is windowed with them: the page holds the
@@ -18,19 +18,27 @@
 // rows back as the viewport moves, so the library has no size ceiling.
 extern lv_obj_t *medialist_screen;
 extern lv_obj_t *medialist_tracks_screen;
-// The middle level: one artist's records. Its own screen and not the first
-// one reused, because the way back from an album's tracks is that artist's
-// albums and the way back from those is the artist list -- three lists, and a
-// screen cannot be two of them at once.
+// The middle level: one artist's or one genre's records. Its own screen and
+// not the first one reused, because the way back from an album's tracks is
+// those albums and the way back from those is the artist or genre list -- three
+// lists, and a screen cannot be two of them at once.
 extern lv_obj_t *medialist_albums_screen;
 
 void medialist_init(gui_config_t *cfg);
 
-// Whether tapping an artist opens their records or their tracks. On by default;
-// Music > Display options turns it off, and an artist page is then a flat list
-// of that artist's tracks, with the album grouping on the corner button.
+// Whether tapping an artist or a genre opens its records or its tracks. On by
+// default; Music > Display options turns it off, and an artist or genre page is
+// then a flat list of tracks (an artist's with the album grouping on the corner
+// button).
 bool medialist_album_view(void);
 void medialist_set_album_view(bool on);
+
+// "Go to the current track": All tracks, Albums, Artists, Album artists and
+// Genres open scrolled to the row of what is playing -- the track itself in
+// All tracks, its album, artist, album artist or genre in the others. Off by
+// default; Music > Display options.
+bool medialist_go_to_current(void);
+void medialist_set_go_to_current(bool on);
 
 // Whether a track row wears a small badge saying what it is -- lossy, CD,
 // hi-res or DSD -- under its title. Off by default.
@@ -38,12 +46,17 @@ bool medialist_quality_badges(void);
 void medialist_set_quality_badges(bool on);
 
 // "Show artist": the artist under the title of each row, on the lists `lists`
-// picks out -- all the tracks, the albums, the tracks of a genre, the
-// favourites. The tracks show their own artist, the albums their album artist.
+// picks out -- all the tracks, the albums, a genre's albums and tracks, the
+// favourites, the playlists. The tracks show their own artist, the albums
+// their album artist.
 #define MEDIALIST_ARTIST_TRACKS 1
 #define MEDIALIST_ARTIST_ALBUMS 2
 #define MEDIALIST_ARTIST_GENRES 4
 #define MEDIALIST_ARTIST_FAVOURITES 8
+#define MEDIALIST_ARTIST_PLAYLISTS 16
+#define MEDIALIST_ARTIST_ALL                                                                                       \
+	(MEDIALIST_ARTIST_TRACKS | MEDIALIST_ARTIST_ALBUMS | MEDIALIST_ARTIST_GENRES | MEDIALIST_ARTIST_FAVOURITES |   \
+	 MEDIALIST_ARTIST_PLAYLISTS)
 bool medialist_show_artist(void);
 int medialist_artist_lists(void);
 void medialist_set_show_artist(bool on, int lists);
@@ -64,10 +77,19 @@ void medialist_sort_prefs(unsigned *desc_mask, unsigned *added_mask, bool *artis
 // for the name kinds both filter arguments are ignored.
 void medialist_open(const char *title, library_list_t kind, library_filter_t filter, const char *filter_value);
 
+// Opens one artist the way their disc button was last left: the records, or
+// the tracks strung out. What the search opens an artist with.
+void medialist_open_artist(const char *name);
+
 // Re-reads what is playing and moves the accent mark to whichever rows now
 // carry it. Called from the player whenever the track changes; cheap enough
 // to call on a track that has not (it walks two dozen pool rows).
 void medialist_notify_now_playing(void);
+
+// The list on screen brought up to date with the index, for a page that comes
+// back into view without being loaded again: the player sheet sliding off it.
+// Nothing happens when the list has not changed or no list is on screen.
+void medialist_refresh_visible(void);
 
 // The same track list, filled from an explicit set of paths rather than from
 // the index: what a playlist's contents are. There is no query behind it, so

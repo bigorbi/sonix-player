@@ -96,17 +96,6 @@ int playlists_count_lines(const char *name);
 // backup.
 bool playlists_file_stamp(const char *name, char *path_out, size_t path_size, long *mtime_out, long *size_out);
 
-// Whether any of a playlist's entries have not been looked for on the card
-// since it was last mounted. The list draws from what is written down either
-// way; this says whether playlists_verify() has anything to do.
-bool playlists_needs_verify(const char *name);
-
-// Looks for the entries above and writes down what it found. One card lookup
-// each, bounded, so this belongs on a thread and not in front of a user: what
-// it is for is the page opening at once and correcting itself a moment later.
-// True when something changed, which is also when the open list reloads.
-bool playlists_verify(const char *name);
-
 // Writes the playlist out as <card>/Playlist/<name>.m3u, replacing an earlier
 // backup of the same name. Every entry goes in, missing files included: a
 // backup is what the playlist holds, and a track off the card today can be back
@@ -116,12 +105,13 @@ bool playlists_backup(const char *name, char *path_out, size_t path_size);
 // ---------------------------------------------------------------------------
 // Import
 //
-// What the page's import button works on. Two places: loose .m3u/.m3u8 files at
-// the root of the card, which is where a list copied off a computer lands, and
-// the Playlist folder, which is where Backup writes. The second is what brings
-// a deleted playlist back -- its backup is still there. A backup of a playlist
-// that still exists is not offered, since importing it would only make a second
-// copy of something already on the page.
+// What the page's import button works on. Loose .m3u/.m3u8 files at the root of
+// the card, which is where a list copied off a computer lands, the Playlist
+// folder, which is where Backup writes, and the stock player's playlist_data.
+// The Playlist folder is what brings a deleted playlist back -- its backup is
+// still there. A file named like a playlist that exists is offered too, marked
+// as such: importing it replaces that playlist with what the file holds, which
+// is how an edited copy goes back in.
 //
 // Importing reads a list once and writes it into the index as a playlist of
 // this player's own: every entry resolved to a path it can open, the ones the
@@ -139,6 +129,7 @@ typedef struct {
 	char name[201]; // what it would be called: the file name, without extension
 	char path[512]; // the file itself
 	enum PlaylistLocation playlist_location; // a backup, rather than a loose file at the root
+	bool exists; // a playlist already answers to `name`: importing replaces it
 } playlists_candidate_t;
 
 // Fills `out` with at most `max` importable playlists, by name. Returns how
@@ -163,6 +154,12 @@ typedef struct {
 // index -- not something to call from the interface thread. False when the file
 // cannot be read or nothing in it could be resolved, and then nothing was
 // written. The source file is never touched.
-bool playlists_import(const char *source_path, playlists_import_result_t *out);
+//
+// With `overwrite`, a playlist that already has the file's name is replaced by
+// what the file holds; without it the import takes the name with a number
+// added. The replacement is written beside the old playlist first and only
+// takes its place once it is complete, so a failed import leaves the old one
+// as it was.
+bool playlists_import(const char *source_path, bool overwrite, playlists_import_result_t *out);
 
 #endif // PLAYLISTS_H

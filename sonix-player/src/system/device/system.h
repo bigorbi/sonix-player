@@ -75,6 +75,13 @@ const char *storage_sd_device(void);
 // outlives the card that was pulled out.
 bool storage_card_attached(void);
 
+// Reopens whichever of the card's databases -- music, audiobooks, radio,
+// podcasts, thumbnails -- was deleted or replaced since it was opened. Called
+// after something on the device may have removed files: the file manager, the
+// Wi-Fi transfer page. Interface thread; a database that changed is closed and
+// opened again, an unchanged one costs a stat().
+void storage_card_files_recheck(void);
+
 // Looks at the card and puts it back if it has gone missing: a mount that has
 // died under it -- the card was pulled, or a USB export unmounted it and the
 // remount did not take -- is cleared, the card is mounted again, and
@@ -96,6 +103,13 @@ void storage_recheck_card(void);
 // the card busy, which leaves FAT and exFAT with their volume-dirty flag set.
 // Call it last, after anything that still writes to the card.
 void storage_release_for_shutdown(void);
+
+// "Lock keys while the screen is off": with it on, volume down + power pressed
+// with the screen off locks the buttons on the case, and pressed again unlocks
+// them. Locked, they are ignored while the screen is off; the power key and the
+// headphone remote keep working. Turning the option off drops the lock. Off
+// until set.
+void input_set_key_lock(bool on);
 
 #ifdef HOST_BUILD
 // Feeds one key press or release to the button thread, as if it had come off

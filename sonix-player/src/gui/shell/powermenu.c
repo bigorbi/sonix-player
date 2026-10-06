@@ -57,7 +57,7 @@ typedef struct {
 static slide_t slide_off;
 static slide_t slide_reboot;
 
-bool powermenu_is_open(void) { return panel && !lv_obj_has_flag(panel, LV_OBJ_FLAG_HIDDEN); }
+bool powermenu_is_open(void) { return panel && !lv_obj_is_hidden(panel); }
 
 // ---------------------------------------------------------------------------
 // opening and closing
@@ -73,14 +73,14 @@ void powermenu_show(void) {
 	slide_reset(&slide_off);
 	slide_reset(&slide_reboot);
 
-	lv_obj_remove_flag(panel, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(panel, false);
 	lv_obj_move_foreground(panel);
 	power_hold_screen_on(true);
 }
 
 static void hide(void) {
 	if (panel) {
-		lv_obj_add_flag(panel, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(panel, true);
 	}
 	power_hold_screen_on(false);
 	power_notify_activity();
@@ -98,53 +98,7 @@ void powermenu_request_show(void) { gui_post(async_show_cb, NULL); }
 // than one that takes an extra moment to stop.
 static void do_power_off(void) {
 	printf("power: shutting down\n");
-
-	// Where the music had got to, before anything else stops. The player's own
-	// poll writes this only every ten seconds while playing and on a change of
-	// state, so without this flush a power-off loses up to ten seconds -- and a
-	// position seeked to while paused, which changes no state at all, would
-	// never be written.
-	device_state_remember_flush();
-
-	// The time goes into the RTC before anything else, exactly as the stock
-	// player does on its way out: whatever the clock has learned since it was
-	// last set is otherwise lost the moment the power goes.
-	clock_shutdown();
-
-	// The radio database is on the card: close it so its journal is tidied
-	// away before the power goes, rather than left for the next boot to find.
-	radio_store_close();
-
-	// Streamed and downloaded tracks are transient and must not survive a
-	// power cycle: without this the hidden folders carry a gigabyte of files
-	// the user never put there and will not listen to again.
-	qobuzcache_clear_on_exit();
-	tidalcache_clear_on_exit();
-	podcastcache_clear_on_exit();
-	dlna_clear_on_exit();
-
-	// Dark the panel *first*: `poweroff` goes through init's shutdown hooks,
-	// which it must -- the raw syscall with USB attached leaves the PMIC to
-	// boot the device straight back up -- and those take a few seconds. With
-	// the screen already off the wait is invisible; without it the menu sits
-	// frozen on-screen until init gets around to cutting power.
-	power_screen_off();
-
-	// The charger back on before the power goes: the driver keeps that bit
-	// across a shutdown, and a device put away at its charge limit would meet
-	// the next cable with a charger that does nothing.
-	power_charging_release();
-
-	// Last, after everything above that writes to the card.
-	storage_release_for_shutdown();
-	sync();
-
-	int rc = system("poweroff");
-	(void)rc;
-	sleep(8);
-
-	// Last resort if init never got there.
-	reboot(RB_POWER_OFF);
+	power_shutdown();
 }
 
 static void do_reboot(void) {
@@ -160,7 +114,7 @@ static void do_reboot(void) {
 	storage_release_for_shutdown();
 	sync();
 
-	// Through init, the same way down as the shutdown above. `reboot(RB_AUTOBOOT)`
+	// Through init, the same way down as power_shutdown(). `reboot(RB_AUTOBOOT)`
 	// restarts the machine from inside this process: init's shutdown hooks never
 	// run, so the daemons are not stopped and nothing is remounted read-only or
 	// unmounted, apart from the card, which is released above either way.
@@ -239,7 +193,7 @@ static void make_slide(lv_obj_t *parent, slide_t *s, const lv_image_dsc_t *icon,
 	lv_obj_set_style_bg_opa(s->pill, LV_OPA_20, 0);
 	lv_obj_set_style_border_width(s->pill, 0, 0);
 	lv_obj_set_style_pad_all(s->pill, 0, 0);
-	lv_obj_remove_flag(s->pill, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_set_scrollable(s->pill, false);
 
 	// The instruction, centred on the pill; it fades as the knob advances.
 	s->label = lv_label_create(s->pill);
@@ -274,7 +228,7 @@ static void make_slide(lv_obj_t *parent, slide_t *s, const lv_image_dsc_t *icon,
 	// prevent. With ADV_HITTEST the slider only answers a press that begins on
 	// the knob, so the value can only be dragged to the end. A tap on the rest
 	// of the pill does nothing.
-	lv_obj_add_flag(s->slider, LV_OBJ_FLAG_ADV_HITTEST);
+	lv_obj_set_adv_hittest(s->slider, true);
 	// The knob stays easy to grab: the extended area applies to its hit-test,
 	// not to the track.
 	lv_obj_set_ext_click_area(s->slider, SLIDE_HEIGHT / 2);
@@ -294,7 +248,7 @@ static void make_slide(lv_obj_t *parent, slide_t *s, const lv_image_dsc_t *icon,
 	s->knob_icon_w = (int)icon->header.w;
 	lv_obj_set_style_image_recolor(s->knob_icon, icon_tint, 0);
 	lv_obj_set_style_image_recolor_opa(s->knob_icon, LV_OPA_COVER, 0);
-	lv_obj_add_flag(s->knob_icon, LV_OBJ_FLAG_IGNORE_LAYOUT);
+	lv_obj_set_ignore_layout(s->knob_icon, true);
 
 	slide_track_knob(s);
 }
@@ -310,8 +264,8 @@ void powermenu_init(gui_config_t *cfg) {
 	lv_obj_set_style_border_width(panel, 0, 0);
 	lv_obj_set_style_radius(panel, 0, 0);
 	lv_obj_set_style_pad_all(panel, 0, 0);
-	lv_obj_remove_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_add_flag(panel, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_scrollable(panel, false);
+	lv_obj_set_hidden(panel, true);
 
 	// The two pills, upper third of the screen, like the real thing.
 	lv_obj_t *pills = lv_obj_create(panel);
@@ -321,7 +275,7 @@ void powermenu_init(gui_config_t *cfg) {
 	lv_obj_set_style_border_width(pills, 0, 0);
 	lv_obj_set_style_pad_all(pills, 0, 0);
 	lv_obj_set_style_pad_gap(pills, 26, 0);
-	lv_obj_remove_flag(pills, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_set_scrollable(pills, false);
 	lv_obj_set_flex_flow(pills, LV_FLEX_FLOW_COLUMN);
 	lv_obj_set_flex_align(pills, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 

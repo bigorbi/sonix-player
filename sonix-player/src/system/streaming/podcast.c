@@ -41,7 +41,9 @@ bool podcast_configured(void) { return streamkeys_podcast_key() && streamkeys_po
 static const char *api_base(void) { return config_get("podcast", "api_base", PODCAST_API_DEFAULT); }
 
 // The ISO code of the interface language, so a user running the player in
-// Italian does not get an all-English chart.
+// Italian does not get an all-English chart. The directory takes a
+// comma-separated list: the regional tags many Brazilian and Chinese feeds
+// declare are listed beside the bare code.
 //
 // The table lives here rather than in lang.c because this is its only caller:
 // lang.c works in language names, which is what a menu needs, and teaching it
@@ -51,8 +53,17 @@ static const char *interface_language_code(void) {
 		const char *name;
 		const char *code;
 	} MAP[] = {
-		{"Italiano", "it"}, {"English", "en"}, {"Deutsch", "de"}, {"Fran\xC3\xA7\x61is", "fr"},
-		{"Espa\xC3\xB1ol", "es"}, {"Japanese", "ja"}, {"Nederlands", "nl"},
+		{"Italiano", "it"},
+		{"English", "en"},
+		{"Deutsch", "de"},
+		{"Fran\xC3\xA7\x61is", "fr"},
+		{"Espa\xC3\xB1ol", "es"},
+		{"Japanese", "ja"},
+		{"Nederlands", "nl"},
+		{"Polski", "pl"},
+		{"Russian", "ru"},
+		{"Chinese", "zh,zh-cn"},
+		{"Portugu\xC3\xAAs BR", "pt,pt-br"},
 	};
 	const char *current = lang_current();
 	for (size_t i = 0; i < sizeof(MAP) / sizeof(MAP[0]); i++) {
@@ -397,6 +408,23 @@ int podcast_skip_forward(void) { return clamp_skip(config_get_int("podcast", "sk
 void podcast_set_skip_back(int seconds) { config_set_int("podcast", "skip_back", clamp_skip(seconds)); }
 
 void podcast_set_skip_forward(int seconds) { config_set_int("podcast", "skip_forward", clamp_skip(seconds)); }
+
+int podcast_speed_permille(void) {
+	long value = config_get_int("podcast", "speed", 1000);
+	if (value < 250 || value > 4000) {
+		value = 1000;
+	}
+	return (int)value;
+}
+
+void podcast_set_speed_permille(int permille) {
+	if (permille < 250 || permille > 4000) {
+		permille = 1000;
+	}
+	config_set_int("podcast", "speed", permille);
+}
+
+double podcast_speed(void) { return (double)podcast_speed_permille() / 1000.0; }
 
 bool podcast_stop_at_episode_end(void) { return config_get_int("podcast", "stop_episode_end", 0) != 0; }
 

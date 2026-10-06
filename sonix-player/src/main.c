@@ -30,6 +30,7 @@
 #include "src/system/audio/audio.h"
 #include "src/system/library/audiobookdb.h"
 #include "src/system/bluetooth/bluetooth.h"
+#include "src/system/bluetooth/btlog.h"
 #include "src/system/bluetooth/btplayer.h"
 #include "src/system/device/clock.h"
 #include "src/system/device/factoryreset.h"
@@ -939,15 +940,10 @@ static void install_signal_guards(void) {
 }
 
 #ifdef HOST_BUILD
-#include "src/drivers/sdl/lv_sdl_keyboard.h"
-#include "src/drivers/sdl/lv_sdl_mouse.h"
-#include "src/drivers/sdl/lv_sdl_window.h"
 #include <SDL2/SDL.h>
 
 #define GET_MUSIC_DIR() (snprintf((char[256]){0}, 256, "%s/Music", getenv("HOME") ? getenv("HOME") : ""))
 #else
-#include "src/drivers/display/fb/lv_linux_fbdev.h"
-#include "src/drivers/evdev/lv_evdev.h"
 #include <fcntl.h>
 #include <linux/fb.h>
 #include <sys/ioctl.h>
@@ -963,8 +959,7 @@ static void install_signal_guards(void) {
 //
 // LVGL has kinetic scrolling of its own -- the list glides and brakes when the
 // finger lifts -- but with the factory values it is barely noticeable on this
-// screen. Two knobs, both per-indev and with no public setter in 9.1, hence
-// the private header include:
+// screen. Two knobs, both per-indev:
 //
 //   * scroll_throw: the percentage the velocity drops on each frame of the
 //     throw animation. The default 10 kills the glide in half a second; at 5
@@ -976,7 +971,6 @@ static void install_signal_guards(void) {
 // Applied to both the device touch panel and the simulator mouse, so the two
 // feel the same.
 // ---------------------------------------------------------------------------
-#include "lvgl/src/indev/lv_indev_private.h"
 
 #define SCROLL_THROW_DECAY_PCT 5
 #define SCROLL_START_LIMIT_PX 4
@@ -1027,8 +1021,8 @@ static void tune_kinetic_scroll(lv_indev_t *indev) {
 	if (!indev) {
 		return;
 	}
-	indev->scroll_throw = SCROLL_THROW_DECAY_PCT;
-	indev->scroll_limit = SCROLL_START_LIMIT_PX;
+	lv_indev_set_scroll_throw(indev, SCROLL_THROW_DECAY_PCT);
+	lv_indev_set_scroll_limit(indev, SCROLL_START_LIMIT_PX);
 }
 
 // Kinetic scrolling and the tap guard, for the touch panel and the simulator mouse.
@@ -2051,6 +2045,7 @@ int main(int argc, char **argv) {
 
 #ifndef HOST_BUILD
 	logging_attach_sd(storage_sd_root());
+	btlog_card_attach(storage_sd_root());
 	// Now that the log is on the card: whatever the kernel said about the
 	// previous run, which is the only place a SIGKILL leaves a trace.
 	logging_report_previous_run();
@@ -2199,10 +2194,18 @@ int main(int argc, char **argv) {
 	// and returns at once; if a switch was on, the bring-up happens on that
 	// worker while the interface carries on drawing.
 	wifi_init();
+	// Before the radio, so a bring-up that fails is in the Bluetooth log from
+	// its first line.
+	btlog_init();
 	bluetooth_init();
 	// Its worker starts here but stays idle: no socket is opened until the
 	// switch is on, which the same config read decides.
 	sonixlink_init();
+
+	// The sleep timers, as they were left. Before the interface: the music,
+	// audiobook and podcast pages read their switch and their wheels while
+	// they are built, and read before this they all say off, 0 minutes.
+	sleeptimer_init();
 
 	gui_init(&gui_cfg);
 
@@ -2215,7 +2218,6 @@ int main(int argc, char **argv) {
 	// The USB-C port, allowed to take a peripheral. Before the volume restore
 	// below, so that a DAC already plugged in at boot is found and the level
 	// lands on it rather than on a CS43198 nobody is listening to.
-	sleeptimer_init();
 	usbaudio_init();
 	usbaudio_poll();
 

@@ -243,10 +243,24 @@ static void screen_power(bool on) {
 // Enable/disable every LVGL input device (i.e. the touchscreen). Physical
 // buttons live in their own threads and are unaffected, so volume/power keys
 // keep working while the screen is off -- only stray touches are ignored.
+//
+// On the way back, a finger already on the panel is not a tap on the page.
+// A double-tap wake fires on the second tap's touch-down, and that tap is
+// usually still down when the panel comes back 60 ms later: LVGL would see it
+// as a fresh press and click whatever lies under it on release. The position
+// it reports is not to be trusted either: one the controller sent in doze, or
+// the last touch before the blank, which is often the switch that was just
+// turned on (the Wi-Fi transfer page's own, for one), which the wake would
+// then turn straight off. lv_indev_wait_release() drops that press up to its
+// release; with no finger down it clears on the first read and the next tap
+// goes through as usual.
 static void set_indevs_enabled(bool enable) {
 	lv_indev_t *indev = lv_indev_get_next(NULL);
 	while (indev) {
 		lv_indev_enable(indev, enable);
+		if (enable && lv_indev_get_type(indev) == LV_INDEV_TYPE_POINTER) {
+			lv_indev_wait_release(indev);
+		}
 		indev = lv_indev_get_next(indev);
 	}
 }
@@ -278,6 +292,7 @@ static uint32_t input_idle_ms(uint32_t now) {
 }
 
 static bool g_screen_on_hold;
+static bool g_screen_view_hold; // see power_hold_screen_for_view
 
 // ---------------------------------------------------------------------------
 // charge limit
@@ -909,27 +924,63 @@ static void rtc_alarm_arm_for_auto_off(void) {
 	printf("power: mem: RTC wake in %ld s for the automatic shutdown\n", remaining_s);
 }
 
-// The actual shutdown, shared by the normal awake tick and the RTC alarm path
-// just after a resume.
-static void power_auto_off_now(const char *why) {
-	printf("power: automatic shutdown: %s\n", why);
-	fflush(stdout);
-	// The charger goes back on before the power goes off. The driver keeps this
-	// bit across a shutdown -- mp2731_shutdown writes it from the property it
-	// has stored -- so a player that switched it off at the limit would leave a
-	// device that will not charge until it is booted again.
-	power_charging_release();
-	// Where the music had got to: this path never goes through the interface,
-	// which is what normally writes it.
+void power_shutdown(void) {
+	// Where the music had got to, before anything else stops. The player's own
+	// poll writes this only every ten seconds while playing and on a change of
+	// state, so without this flush a power-off loses up to ten seconds -- and a
+	// position seeked to while paused, which changes no state at all, would
+	// never be written.
 	device_state_remember_flush();
-	clock_shutdown(); // the RTC gets the time before the power goes
-	qobuzcache_clear_on_exit(); // the cache does not survive a shutdown
+
+	// The time goes into the RTC before anything else, exactly as the stock
+	// player does on its way out: whatever the clock has learned since it was
+	// last set is otherwise lost the moment the power goes.
+	clock_shutdown();
+
+	// The radio database is on the card: close it so its journal is tidied
+	// away before the power goes, rather than left for the next boot to find.
+	radio_store_close();
+
+	// Streamed and downloaded tracks are transient and must not survive a
+	// power cycle: without this the hidden folders carry a gigabyte of files
+	// the user never put there and will not listen to again.
+	qobuzcache_clear_on_exit();
 	tidalcache_clear_on_exit();
 	podcastcache_clear_on_exit();
 	dlna_clear_on_exit();
-	logging_flush();
+
+	// Dark the panel first: `poweroff` goes through init's shutdown hooks,
+	// which it must -- the raw syscall with USB attached leaves the PMIC to
+	// boot the device straight back up -- and those take a few seconds. With
+	// the screen already off the wait is invisible.
+	power_screen_off();
+
+	// The charger back on before the power goes: the driver keeps that bit
+	// across a shutdown -- mp2731_shutdown writes it from the property it has
+	// stored -- and a device put away at its charge limit would meet the next
+	// cable with a charger that does nothing.
+	power_charging_release();
+
+	// Last, after everything above that writes to the card: a library check
+	// running in the background is stopped, the databases closed and the card
+	// unmounted.
+	storage_release_for_shutdown();
 	sync();
+
+	int rc = system("poweroff");
+	(void)rc;
+	sleep(8);
+
+	// Last resort if init never got there.
 	reboot(RB_POWER_OFF);
+}
+
+// The automatic shutdown, from the normal awake tick and from the RTC alarm
+// path just after a resume: the same way down as the power menu's.
+static void power_auto_off_now(const char *why) {
+	printf("power: automatic shutdown: %s\n", why);
+	fflush(stdout);
+	power_shutdown();
 }
 
 static void suspend_to_ram(void) {
@@ -1572,7 +1623,8 @@ static void power_timer_cb(lv_timer_t *timer) {
 	uint32_t off_idle_wall = boottime_ms() - g_last_active_boot_ms;
 
 	// 4. auto screen-off after the configured input-idle timeout
-	if (g_screen_on && g_cfg.screen_off_enabled && !g_screen_on_hold && input_idle >= g_cfg.screen_off_timeout_ms) {
+	if (g_screen_on && g_cfg.screen_off_enabled && !g_screen_on_hold && !g_screen_view_hold &&
+		input_idle >= g_cfg.screen_off_timeout_ms) {
 		// Say why. A screen that goes dark on its own is indistinguishable
 		// from a crash unless the log records that it was the idle timer.
 		printf("power: screen off after %u ms without input (timeout %u ms)\n", input_idle,
@@ -1654,6 +1706,21 @@ void power_hold_screen_on(bool hold) {
 		// scan, the power menu): without resetting the idle clocks here the
 		// screen-off timer would fire on the very next tick, blanking the
 		// panel the moment the long job announces it has finished.
+		power_notify_activity();
+		if (g_disp) {
+			lv_display_trigger_activity(g_disp);
+		}
+	}
+}
+
+void power_hold_screen_for_view(bool hold) {
+	if (hold == g_screen_view_hold) {
+		return;
+	}
+	g_screen_view_hold = hold;
+	if (!hold) {
+		// As above: the idle timer starts over from the moment the view went,
+		// not from the last touch before it came up.
 		power_notify_activity();
 		if (g_disp) {
 			lv_display_trigger_activity(g_disp);

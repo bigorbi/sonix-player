@@ -24,6 +24,13 @@
 bool library_open(const char *db_path);
 void library_close(void);
 
+// Closes and reopens the index when its file is no longer the one that was
+// opened: deleted (from the file manager, the Wi-Fi transfer page) or replaced
+// by another under the same name. A deleted database stays readable through the
+// open handle, so without this the library would go on showing what it held.
+// Reopening a deleted one creates it empty. True when it reopened.
+bool library_reopen_if_replaced(void);
+
 // How many tracks the index currently holds.
 int library_track_count(void);
 
@@ -34,15 +41,140 @@ int library_track_count(void);
 // on its own thread and the UI polls the counters below.
 // ---------------------------------------------------------------------------
 
-// Starts a scan of `root`, wiping whatever was indexed before. Returns false
-// if a scan is already running or the database is not open.
-// The folders at the root of the card the scan reads, as saved in [library]
-// scan_folders: names separated by '/', empty for the whole card. A scan limited
-// to some folders leaves out the files at the root of the card too.
-const char *library_scan_folders(void);
+// The folders at the root of the card the scan reads; none for the whole card.
+// A scan limited to some folders leaves out the files at the root of the card
+// too. library_scan_folders() returns an array the caller frees with
+// library_scan_folders_free(), NULL with *count 0 for the whole card.
+char **library_scan_folders(int *count);
+void library_scan_folders_free(char **names, int count);
 void library_scan_folders_set(const char *const *names, int count);
 
+// Starts a scan of `root`, wiping whatever was indexed before. Returns false
+// if a scan is already running or the database is not open. A Detect changes
+// run in progress is stopped first: the scan does everything it would.
 bool library_scan_start(const char *root);
+
+// "Detect changes": at startup and whenever the card comes back -- put in
+// again, returned by a computer, or left by the Wi-Fi transfer -- the index is
+// brought up to date without emptying it. The folders chosen for the scan are walked, and only a
+// folder whose names differ from what the index noted of it is looked into:
+// the tracks whose file is gone are taken out, and the files the index does not
+// have are read and added.
+//
+// Remembered in [library] detect_changes. Off until the first scan completes,
+// when the interface turns it on unless it was already set either way
+// (library_detect_changes_chosen). Nothing happens on a library that was never
+// scanned: building it is the scan's job.
+bool library_detect_changes(void);
+void library_set_detect_changes(bool on);
+bool library_detect_changes_chosen(void);
+
+// Whether Detect changes also reads again every indexed file whose
+// modification time differs from the one the index holds: a file retagged,
+// or replaced by another copy under the same name. One stat per indexed file,
+// so the run takes longer. On by default, [library] detect_retagged.
+bool library_detect_retagged(void);
+void library_set_detect_retagged(bool on);
+
+// ---------------------------------------------------------------------------
+// How the index files tracks
+//
+// A tag naming several artists or genres -- "A & B", "A feat. B", "Rock; Pop"
+// -- can be split at the separators chosen below, and the track is then filed
+// under each name: in the Artists or Genres list, on each one's page, in the
+// search. The tag itself is not touched, and is what a track shows.
+//
+// And an album can be joined: tracks with the same album name in the same
+// folder are one record, whoever the artists on them, so a disc where only
+// some tracks carry an album artist is not dealt out as several.
+//
+// All of it is worked out from what the index already holds, so a change is
+// applied with library_reorganize() rather than a scan.
+// ---------------------------------------------------------------------------
+
+typedef enum {
+	LIBRARY_SPLIT_SEMICOLON = 1 << 0, // ;
+	LIBRARY_SPLIT_SLASH = 1 << 1,	  // /
+	LIBRARY_SPLIT_AMPERSAND = 1 << 2, // &
+	LIBRARY_SPLIT_COMMA = 1 << 3,	  // ,
+	LIBRARY_SPLIT_FEAT = 1 << 4,	  // feat., ft., featuring, as a word
+	LIBRARY_SPLIT_VS = 1 << 5,		  // vs., versus, as a word
+} library_split_t;
+
+// [library] split_artists (off) and artist_separators (; / & feat.).
+bool library_split_artists(void);
+void library_set_split_artists(bool on);
+unsigned library_artist_separators(void);
+void library_set_artist_separators(unsigned separators);
+
+// [library] split_genres (off) and genre_separators (; / ,).
+bool library_split_genres(void);
+void library_set_split_genres(bool on);
+unsigned library_genre_separators(void);
+void library_set_genre_separators(unsigned separators);
+
+// The artists never split, wherever they appear in a tag ("AC/DC"), matched
+// without regard to case. Kept in artist_exceptions.txt beside
+// device_config.ini, one per line; "AC/DC" alone until the list is first
+// saved. The array is the caller's, freed with library_artist_exceptions_free().
+char **library_artist_exceptions(int *count);
+void library_artist_exceptions_free(char **names, int count);
+void library_set_artist_exceptions(const char *const *names, int count);
+
+// [library] join_albums, off by default.
+bool library_join_albums(void);
+void library_set_join_albums(bool on);
+
+// Files the index again under the settings above, on the scan thread, without
+// reading the card: the artist and genre lists and the album keys are worked
+// out anew from the tags already indexed. The listener hears REORGANIZING
+// straight away and REORGANIZED when it is done. Busy with Detect changes, it
+// runs as soon as that is over; behind a scan, the same without the
+// REORGANIZING. False, with nothing to do, when there is no index or nothing
+// in it.
+//
+// The index records which settings it was last filed under, so one filed
+// under others -- the settings changed while the card was out or the index
+// closed, a run stopped halfway -- is filed again by library_card_returned()
+// and by library_organize_check().
+bool library_reorganize(void);
+
+// library_reorganize() when the index open now was filed under other settings.
+// Returns whether it started.
+bool library_organize_check(void);
+
+// Called a few seconds after startup, and wherever the card is back and the
+// index reopened. Starts the run above on the scan thread when the setting is
+// on and nothing is scanning, and says whether it did. An index filed under
+// other settings than the current ones (library_reorganize) is filed again as
+// well: after the run, or on its own when the setting is off.
+bool library_card_returned(const char *root);
+
+// Told about a Detect changes run: LOOKING as soon as it is asked for, on the
+// thread that asked; then, on the scan thread, ADDING with the number of new
+// files (`added`) and of changed ones (`updated`) when there are some and they
+// are about to be read, and as the thread's last word either FINISHED with the
+// tracks that went in, came out and were read again (all zero when nothing
+// changed) or STOPPED when it was cut short with nothing done. The index filed
+// again on the same thread afterwards (library_card_returned) comes before
+// that last word, as a REORGANIZED or STOPPED of its own.
+//
+// About library_reorganize(): REORGANIZING on the thread that asked,
+// REORGANIZED on the scan thread when it is done, or STOPPED when it was not.
+//
+// And SCANNED on the scan thread when a library_scan_start() scan has gone
+// through to the end.
+typedef enum {
+	LIBRARY_UPDATE_LOOKING,
+	LIBRARY_UPDATE_ADDING,
+	LIBRARY_UPDATE_FINISHED,
+	LIBRARY_UPDATE_STOPPED,
+	LIBRARY_UPDATE_REORGANIZING,
+	LIBRARY_UPDATE_REORGANIZED,
+	LIBRARY_UPDATE_SCANNED,
+} library_update_event_t;
+typedef void (*library_update_listener_t)(library_update_event_t event, int added, int removed, int updated);
+void library_set_update_listener(library_update_listener_t listener);
 
 // Whether there is an index to ask. False while the card is handed to a
 // computer over USB -- the export closes the database -- while the card is out,
@@ -105,6 +237,9 @@ typedef enum {
 	LIBRARY_FILTER_ARTIST,
 	LIBRARY_FILTER_ALBUM_ARTIST,
 	LIBRARY_FILTER_GENRE,
+	// The tracks, albums or artists whose name contains the value, matched the
+	// way library_search() matches. For the handles below only.
+	LIBRARY_FILTER_SEARCH,
 } library_filter_t;
 
 // Streams the whole result set, sorted by the collation, one row per call:
@@ -126,6 +261,13 @@ typedef enum {
 	LIBRARY_ORDER_ADDED,	   // by when the file landed on the card, oldest
 							   // first; all tracks, albums, artists and album
 							   // artists only (a row is as new as its newest file)
+	LIBRARY_ORDER_YEAR,		   // by release year, earliest first; all tracks and
+							   // all albums only (an album's year is its tracks'
+							   // latest). Rows with no year come last.
+	LIBRARY_ORDER_YEAR_DESC,   // the same, latest first, and still with the rows
+							   // that have no year last -- which is why it is an
+							   // order of its own and not the one above read
+							   // backwards
 } library_order_t;
 int library_for_each_ordered(library_list_t kind, library_filter_t filter, const char *value, library_order_t order,
 							 library_row_cb cb, void *user);
@@ -349,6 +491,11 @@ void library_index_describe(const library_index_t *ix, library_index_spec_t *out
 // list underneath it has been rebuilt.
 int library_index_find_path(const library_index_t *ix, const char *path);
 
+// The same for a name list -- albums, artists, album artists, genres -- by the
+// name a row of it carries. An album value with its key finds that record; a
+// name alone finds the first album of that name. -1 when it is not in the list.
+int library_index_find_name(const library_index_t *ix, const char *name);
+
 // Bumped whenever the row ids of the tables behind `kind` may have moved.
 // Favourites count separately from the index: starring a track rewrites one row
 // of one table and must not invalidate a list of tracks.
@@ -377,18 +524,17 @@ int library_search(const char *query, int per_category, library_search_cb_t cb, 
 // written, quoted, because SQLite takes anything between double quotes and a
 // mangled name would no longer be the name the user typed.
 //
-// A table answers a name, a track count and which entries are still there from
-// the index, which is one file the card has open already; reading them off .m3u
-// files meant opening every file and a card lookup per entry. The .m3u form is
-// what Backup writes and what Import reads.
+// A table answers a name, a track count and which entries are there from the
+// index, which is one file the card has open already: opening a playlist reads
+// nothing off the card. The .m3u form is what Backup writes and what Import
+// reads.
 //
-// Each row carries what a row on screen needs -- the path, the title and artist
-// to show, the duration -- so opening a playlist does not read tags off the
-// card either. `present` is whether the file was there the last time it was
-// looked for, and `mount` says which mounting of the card that was: a row
-// checked on this mount is trusted, an older one is looked at again. That holds
-// because the player cannot delete a track, so what changes underneath a
-// playlist is the card going somewhere else and coming back.
+// Each row carries the path, the duration, and a title and artist written down
+// when it went in. A row on screen shows the library's title and artist for
+// the track when the library has it, and the written-down ones otherwise. A
+// track the library has is shown; one it does not have is shown when `present`
+// says its file was on the card -- set when the entry goes in, and cleared by
+// a scan or a Detect changes run that walked its folder without finding it.
 // ---------------------------------------------------------------------------
 
 #define LIBRARY_PLAYLIST_PREFIX "M3U_"
@@ -398,8 +544,7 @@ typedef struct {
 	char title[512];
 	char artist[256];
 	long seconds; // -1 when it could not be worked out, as in M3U
-	bool present; // whether the file was there at the last look
-	bool checked; // whether that look happened on the mount in the reader now
+	bool present; // whether the file was on the card (see above)
 } library_playlist_row_t;
 
 // How big one of these is: a path, a title and an artist at full length, near
@@ -423,8 +568,7 @@ bool library_playlist_drop(const char *name);
 // does nothing.
 bool library_playlist_rename(const char *name, const char *new_name);
 
-// Appends a row, creating the playlist if it is not there. `present` and
-// `checked` in `row` are ignored: an entry being added has just been looked at.
+// Appends a row, creating the playlist if it is not there.
 bool library_playlist_append(const char *name, const library_playlist_row_t *row);
 
 // Appending many, one at a time, under one transaction: an import writes
@@ -443,29 +587,19 @@ bool library_playlist_write_end(library_playlist_writer_t *writer, bool keep);
 // them: see the note on the size of one.
 bool library_playlist_append_all(const char *name, const library_playlist_row_t *rows, int count);
 
-// Rows [offset, offset+count) in order, into a buffer the caller owns. Returns
-// how many were written: fewer than asked means the end of the playlist. Read
+// Rows [offset, offset+count) in order, every entry including the hidden ones,
+// with the title and artist a row shows (see above), into a buffer the caller
+// owns. Returns how many were written: fewer than asked means the end of the
+// playlist. Read
 // in pages, so that nothing holds more than a pageful and the index lock is
 // released between them.
 int library_playlist_page(const char *name, int offset, int count, library_playlist_row_t *out);
-
-// Whether any entry has not been looked for on the card since it was last
-// mounted. One indexed question, no rows read.
-bool library_playlist_has_unchecked(const char *name);
 
 // Every row, in order, in one malloc'd array; free() it when done. Two
 // kilobytes a row -- see above -- so this is for a caller that knows the
 // playlist is small. Nothing in the player uses it; the readers all go through
 // library_playlist_page().
 int library_playlist_rows(const char *name, library_playlist_row_t **rows_out);
-
-// Records what a presence walk found, for the rows it got to, against the
-// mount in the reader now. One transaction.
-typedef struct {
-	int index; // the row's position in the array library_playlist_rows() gave
-	bool present;
-} library_playlist_presence_t;
-bool library_playlist_set_presence(const char *name, const library_playlist_presence_t *marks, int count);
 
 // The first row naming this path, gone.
 bool library_playlist_remove_path(const char *name, const char *path);
@@ -474,8 +608,7 @@ bool library_playlist_remove_path(const char *name, const char *path);
 bool library_playlist_contains(const char *name, const char *path);
 
 // Removes the entries at `positions` -- counted as the page shows the list,
-// entries whose file is missing left out -- in one transaction. Returns how
-// many went.
+// hidden entries left out -- in one transaction. Returns how many went.
 int library_playlist_remove_positions(const char *name, const int *positions, int count);
 
 // One entry moved from one position to another, the rest closing up behind it.
@@ -486,8 +619,7 @@ int library_playlist_remove_positions(const char *name, const int *positions, in
 // playlist generation, so a page holding a handle over this list notices.
 bool library_playlist_move(const char *name, int from, int to);
 
-// How many of its tracks are there, from the `present` column alone: no card is
-// touched and no rows are read.
+// How many entries are shown (see above). No card is touched.
 int library_playlist_count(const char *name);
 
 // True once per card: whether the .m3u files that were the playlists have

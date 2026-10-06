@@ -11,8 +11,10 @@
 #include "src/gui/shell/icons.h"
 #include "src/gui/settings/musicsettings.h"
 #include "src/gui/audio/peqpage.h"
+#include "src/gui/library/audiobooks.h"
 #include "src/gui/nowplaying/player.h"
 #include "src/gui/shell/scrolltext.h"
+#include "src/gui/streaming/podcastpage.h"
 #include "src/gui/wireless/dlna.h"
 #include "src/gui/wireless/sonixlink.h"
 #include "src/gui/wireless/wifitransfer.h"
@@ -56,6 +58,7 @@
 // second line rather than shrinking.
 #define CIRCLE_BUTTON_SIZE 88
 #define CIRCLE_BUTTON_GAP 14
+#define QP_BUTTONS_PER_LINE 4
 
 // How the sheet divides the screen up: a strip for the close hint at the
 // bottom, small gaps at the top and between the cards, and the rest split
@@ -65,6 +68,9 @@
 #define HINT_STRIP_H 52 // room under the cards for the close line
 #define CARD_TOP_GAP 12 // between the status bar and the first card
 #define CARD_GAP 16	   // between the two cards
+#define CARD_ROW_GAP 12 // between the blocks inside the controls card
+#define HANDLE_ROOM 24	// added under the slider when the card has a handle
+#define BRIGHT_ROW_H 44
 
 // The sheet's own padding. The cards are aligned inside the content area, so
 // every y below is measured from there and not from the top of the screen;
@@ -87,6 +93,7 @@ static lv_obj_t *sleep_music_btn;
 static lv_obj_t *sleep_audiobook_btn;
 static lv_obj_t *sleep_podcast_btn;
 static lv_obj_t *wifi_transfer_btn;
+static lv_obj_t *gapless_btn;
 
 // ---------------------------------------------------------------------------
 // Which buttons the panel carries, and where
@@ -120,6 +127,7 @@ static const char *const button_key[QP_BTN_COUNT] = {
 	[QP_BTN_SLEEP_AUDIOBOOK] = "sleep_audiobook",
 	[QP_BTN_SLEEP_PODCAST] = "sleep_podcast",
 	[QP_BTN_WIFI_TRANSFER] = "wifi_transfer",
+	[QP_BTN_GAPLESS] = "gapless",
 };
 
 static const char *const button_tag[QP_BTN_COUNT] = {
@@ -138,6 +146,7 @@ static const char *const button_tag[QP_BTN_COUNT] = {
 	[QP_BTN_SLEEP_AUDIOBOOK] = "quickpanel_sleep_audiobook",
 	[QP_BTN_SLEEP_PODCAST] = "quickpanel_sleep_podcast",
 	[QP_BTN_WIFI_TRANSFER] = "wifitransfer_title",
+	[QP_BTN_GAPLESS] = "musicsettings_gapless_playback",
 };
 
 static uint8_t slots[QP_SLOT_COUNT];  // the grid, QP_BTN_NONE where it is empty
@@ -171,6 +180,40 @@ static uint32_t drag_begin_ms;
 // the same 480-wide glass, so the same gesture decides the same way on the
 // 720-tall R3 Pro II and the 800-tall R1. 180 is a quarter of 720.
 #define DRAG_COMMIT_PX 180
+
+// ---------------------------------------------------------------------------
+// The stretch of the controls card
+//
+// The card shows the first QP_SLOT_VISIBLE buttons. When the panel holds more,
+// the card is a little taller, a handle sits under the brightness slider, and
+// a drag down on the sheet stretches the card downwards, over the now-playing
+// card: the slider moves down with the edge and the buttons past the eighth
+// open up between the first two lines and the slider, as further lines of the
+// same grid. A drag up folds it back before a second one carries the sheet
+// away. The now-playing card fades as the controls card covers it, and is
+// taken out altogether once it is covered, so a tap under the stretched card
+// cannot reach its transport.
+// ---------------------------------------------------------------------------
+
+static lv_obj_t *controls_card;
+static lv_obj_t *np_card;
+static lv_obj_t *quick_row;	   // the first QP_SLOT_VISIBLE buttons
+static lv_obj_t *extra_clip;	   // the window the stretch opens, under the first lines
+static lv_obj_t *extra_row;	   // the rest, inside that window
+static lv_obj_t *bright_row;	   // moved down by the stretch
+static lv_obj_t *expand_handle; // the line under the slider, and a tap target
+static lv_obj_t *expand_pill;
+static int card_h_rest;		   // both cards' height with nothing past the eighth
+static int card_top;		   // the controls card's top, inside the sheet
+static int card_h_base;		   // the controls card's height at rest, handle room included
+static int expand_full;		   // how far the card stretches; 0 when nothing is past the eighth
+static int expand_h;		   // how far it is stretched now
+static int expand_from;		   // where a drag found it
+static uint32_t expand_begin_ms;
+
+// Set once a press has moved the sheet or the card, so the click that ends the
+// same press does not also fold the card from its handle.
+static bool press_dragged;
 
 // The now-playing card's widgets.
 static lv_obj_t *np_title;
@@ -283,9 +326,9 @@ static void refresh_now_playing_card(void) {
 		}
 		bool steps = station_steps && only_for_tracks[i] != np_repeat_btn;
 		if (state.live && !steps) {
-			lv_obj_add_flag(only_for_tracks[i], LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(only_for_tracks[i], true);
 		} else {
-			lv_obj_remove_flag(only_for_tracks[i], LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(only_for_tracks[i], false);
 		}
 	}
 
@@ -326,16 +369,16 @@ static void refresh_now_playing_card(void) {
 	// follows the feed (see star_cb).
 	if (np_repeat_btn) {
 		if (book || podcast) {
-			lv_obj_add_flag(np_repeat_btn, LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(np_repeat_btn, true);
 		} else {
-			lv_obj_remove_flag(np_repeat_btn, LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(np_repeat_btn, false);
 		}
 	}
 	if (np_star_btn) {
 		if (book) {
-			lv_obj_add_flag(np_star_btn, LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(np_star_btn, true);
 		} else {
-			lv_obj_remove_flag(np_star_btn, LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(np_star_btn, false);
 		}
 	}
 
@@ -441,7 +484,7 @@ static void restore_topbar(void) {
 static void hide_when_parked_cb(lv_anim_t *a) {
 	(void)a;
 	if (!panel_open) {
-		lv_obj_add_flag(veil, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(veil, true);
 		restore_topbar();
 	}
 }
@@ -451,7 +494,7 @@ static void panel_slide_to(int y, bool animate) {
 	if (!animate) {
 		lv_obj_set_y(panel, y);
 		if (!panel_open) {
-			lv_obj_add_flag(veil, LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(veil, true);
 			restore_topbar();
 		}
 		return;
@@ -465,6 +508,87 @@ static void panel_slide_to(int y, bool animate) {
 	lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
 	lv_anim_set_completed_cb(&a, hide_when_parked_cb);
 	lv_anim_start(&a);
+}
+
+// ---------------------------------------------------------------------------
+// Stretching the controls card (see the note over controls_card)
+// ---------------------------------------------------------------------------
+
+static void expand_set(int h) {
+	if (!controls_card) {
+		return;
+	}
+	if (h > expand_full) {
+		h = expand_full;
+	}
+	if (h < 0) {
+		h = 0;
+	}
+	expand_h = h;
+	lv_obj_set_height(controls_card, card_h_base + h);
+	lv_obj_set_height(extra_clip, h);
+	lv_obj_set_style_translate_y(bright_row, h, 0);
+
+	// In proportion to the stretch: the second block comes in as the card
+	// uncovers it, and the card underneath goes out as it is covered.
+	lv_opa_t shown = expand_full > 0 ? (lv_opa_t)(LV_OPA_COVER * h / expand_full) : LV_OPA_TRANSP;
+	lv_obj_set_hidden(extra_clip, h == 0);
+	lv_obj_set_style_opa(extra_row, shown, 0);
+	lv_obj_set_hidden(np_card, expand_full > 0 && h >= expand_full);
+	lv_obj_set_style_opa(np_card, (lv_opa_t)(LV_OPA_COVER - shown), 0);
+}
+
+static void expand_anim_cb(void *obj, int32_t v) {
+	(void)obj;
+	expand_set((int)v);
+}
+
+static void expand_to(int h, bool animate) {
+	if (!controls_card) {
+		return;
+	}
+	lv_anim_delete(controls_card, expand_anim_cb);
+	if (!animate) {
+		expand_set(h);
+		return;
+	}
+	lv_anim_t a;
+	lv_anim_init(&a);
+	lv_anim_set_var(&a, controls_card);
+	lv_anim_set_exec_cb(&a, expand_anim_cb);
+	lv_anim_set_values(&a, expand_h, h);
+	lv_anim_set_duration(&a, PANEL_ANIM_MS);
+	lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+	lv_anim_start(&a);
+}
+
+static void expand_drag_begin(void) {
+	lv_anim_delete(controls_card, expand_anim_cb);
+	expand_from = expand_h;
+	expand_begin_ms = lv_tick_get();
+}
+
+static void expand_drag_update(int dy) { expand_set(expand_from + dy); }
+
+// Past halfway it stays stretched, short of it it folds back; a flick goes the
+// way it was flicked, as the sheet's own drag does.
+static void expand_drag_end(void) {
+	int travel = expand_h - expand_from;
+	bool open = expand_h * 2 > expand_full;
+	uint32_t elapsed = lv_tick_elaps(expand_begin_ms);
+	int distance = travel > 0 ? travel : -travel;
+	if (elapsed > 0 && distance >= FLICK_MIN_PX && (distance * 1000) / (int)elapsed >= FLICK_SPEED_PX_S) {
+		open = travel > 0;
+	}
+	expand_to(open ? expand_full : 0, true);
+}
+
+static void expand_handle_clicked_cb(lv_event_t *e) {
+	(void)e;
+	if (press_dragged) {
+		return;
+	}
+	expand_to(expand_h > 0 ? 0 : expand_full, true);
 }
 
 // Everything the sheet has to freshen before it becomes visible, whether it is
@@ -490,7 +614,13 @@ static void panel_prepare(void) {
 	refresh_now_playing_card();
 	refresh_audio_buttons();
 
-	lv_obj_remove_flag(veil, LV_OBJ_FLAG_HIDDEN);
+	// The sheet always comes in folded, as Android's does.
+	expand_to(0, false);
+	if (expand_pill) {
+		lv_obj_set_style_bg_color(expand_pill, theme()->text_primary, 0);
+	}
+
+	lv_obj_set_hidden(veil, false);
 	lv_obj_move_foreground(veil);
 
 	// The player hides the status bar so artwork can run to the top edge. The
@@ -607,11 +737,13 @@ static void veil_clicked_cb(lv_event_t *e) {
 }
 
 // The upward half of the gesture: a drag anywhere on the sheet carries it back
-// out, following the finger all the way.
+// out, following the finger all the way. With buttons past the eighth, a drag
+// down stretches the controls card instead, and a drag up on a stretched card
+// folds it before anything carries the sheet away.
 static void panel_drag_cb(lv_event_t *e) {
 	static lv_point_t start;
 	static bool tracking;
-	static bool engaged;
+	static enum { DRAG_NONE, DRAG_SHEET, DRAG_CARD } engaged;
 
 	lv_indev_t *indev = lv_indev_active();
 	if (!indev) {
@@ -626,7 +758,8 @@ static void panel_drag_cb(lv_event_t *e) {
 	if (code == LV_EVENT_PRESSED) {
 		lv_indev_get_point(indev, &start);
 		tracking = panel_open;
-		engaged = false;
+		engaged = DRAG_NONE;
+		press_dragged = false;
 		return;
 	}
 	if (!tracking) {
@@ -638,23 +771,37 @@ static void panel_drag_cb(lv_event_t *e) {
 	int dy = p.y - start.y;
 
 	if (code == LV_EVENT_PRESSING) {
-		if (!engaged) {
-			if (dy > -8) {
-				return; // not an upward drag yet
+		if (engaged == DRAG_NONE) {
+			if (dy <= -8) {
+				engaged = expand_h > 0 ? DRAG_CARD : DRAG_SHEET;
+			} else if (dy >= 8 && expand_full > 0 && expand_h < expand_full) {
+				engaged = DRAG_CARD;
+			} else {
+				return; // not a drag yet, or a drag down with nothing to uncover
 			}
-			engaged = true;
-			quickpanel_drag_begin();
+			press_dragged = true;
+			if (engaged == DRAG_CARD) {
+				expand_drag_begin();
+			} else {
+				quickpanel_drag_begin();
+			}
 		}
-		quickpanel_drag_update(dy);
+		if (engaged == DRAG_CARD) {
+			expand_drag_update(dy);
+		} else {
+			quickpanel_drag_update(dy);
+		}
 		return;
 	}
 
 	if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
 		tracking = false;
-		if (engaged) {
-			engaged = false;
+		if (engaged == DRAG_CARD) {
+			expand_drag_end();
+		} else if (engaged == DRAG_SHEET) {
 			quickpanel_drag_end();
 		}
+		engaged = DRAG_NONE;
 	}
 }
 
@@ -800,6 +947,12 @@ static void star_cb(lv_event_t *e) {
 // What an empty place in the grid is written as.
 #define QP_SLOT_EMPTY_KEY "-"
 
+// A list is written as two keys of at most eight names each -- `order` and
+// `order_more`, `hidden` and `hidden_more` -- because a setting holds 127
+// characters and sixteen names do not fit in them. Eight of the longest do,
+// with room to spare.
+#define QP_LIST_SPLIT 8
+
 // Reads one comma-separated list of button names into `out`, keeping only names
 // that are still buttons and dropping the ones already taken by an earlier
 // list. A truncated or hand-mangled setting therefore costs the names it
@@ -842,16 +995,19 @@ static uint8_t parse_list(const char *saved, uint8_t *out, uint8_t cap, bool *pl
 //   1  no grid and no list of the ones left out; every button was in the panel
 //   2  a visible list and a hidden list, crossfade out and SonixLink in its place
 //   3  a grid of eight places that can be empty
+//   4  a grid of sixteen places, written without the empty ones at its end and
+//      split over two keys each (see QP_LIST_SPLIT)
 //
 // A file older than the current version is brought forward on the way in: at 1
-// crossfade leaves the panel and SonixLink takes the place it had, and below 3
-// the visible list is poured into the grid, anything past the eighth place
-// going out with the rest.
+// crossfade leaves the panel and SonixLink takes the place it had, and below 4
+// the list is poured into the first eight places, anything past the eighth
+// going out with the rest. The other eight start empty: the panel a file of
+// that age describes is the panel it keeps.
 //
 // Nothing is written here. The move is worked out again at every start until
 // the page is used, and then saved with the rest -- a boot that changes nothing
 // has no business writing to the card.
-#define QP_LAYOUT_VERSION 3
+#define QP_LAYOUT_VERSION 4
 
 static void order_load(void) {
 	if (order_loaded) {
@@ -860,14 +1016,21 @@ static void order_load(void) {
 	order_loaded = true;
 
 	long saved_version = config_get_int("quickpanel", "layout", 1);
+	int grid = saved_version < 4 ? QP_SLOT_VISIBLE : QP_SLOT_COUNT;
 
 	bool placed[QP_BTN_COUNT] = {false};
 
 	// Long enough for a saved grid of empty places plus every button the file
 	// never mentioned, which is the worst a hand-edited file can produce.
 	uint8_t line[QP_SLOT_COUNT + QP_BTN_COUNT];
-	uint8_t line_n = parse_list(config_get("quickpanel", "order", ""), line, QP_SLOT_COUNT, placed);
+	uint8_t line_n = parse_list(config_get("quickpanel", "order", ""), line, QP_LIST_SPLIT, placed);
+	if (saved_version >= 4) {
+		line_n += parse_list(config_get("quickpanel", "order_more", ""), line + line_n,
+							 (uint8_t)(QP_SLOT_COUNT - line_n), placed);
+	}
 	hidden_n = parse_list(config_get("quickpanel", "hidden", ""), hidden, QP_BTN_COUNT, placed);
+	hidden_n += parse_list(config_get("quickpanel", "hidden_more", ""), hidden + hidden_n,
+						   (uint8_t)(QP_BTN_COUNT - hidden_n), placed);
 
 	// Anything the file did not mention: a fresh install, or a button that did
 	// not exist when it was written. It goes into the panel, because a control
@@ -878,12 +1041,12 @@ static void order_load(void) {
 			continue;
 		}
 		// Crossfade, which the migration below is taking out on purpose, and the
-		// buttons that arrive into a grid already holding eight: DLNA and the
-		// three sleep timers. Appending them would push somebody's own buttons
-		// out to make room for ones they never asked for, so they wait among the
-		// unused ones, where the settings page shows them.
+		// buttons that arrive into a panel already holding eight: DLNA, the three
+		// sleep timers, Wi-Fi transfer and gapless. Appending them would change a
+		// panel nobody asked to change, so they wait among the unused ones, where
+		// the settings page shows them.
 		bool waits = i == QP_BTN_DLNA || i == QP_BTN_SLEEP_MUSIC || i == QP_BTN_SLEEP_AUDIOBOOK ||
-					 i == QP_BTN_SLEEP_PODCAST || i == QP_BTN_WIFI_TRANSFER;
+					 i == QP_BTN_SLEEP_PODCAST || i == QP_BTN_WIFI_TRANSFER || i == QP_BTN_GAPLESS;
 		if ((saved_version < 2 && i == QP_BTN_FADE) || waits) {
 			hidden[hidden_n++] = (uint8_t)i;
 		} else {
@@ -917,45 +1080,52 @@ static void order_load(void) {
 	// Into the grid. From version 3 on the list already carries the empty
 	// places as QP_BTN_NONE, so this is a copy; below it, it is the pour.
 	int at = 0;
-	for (int i = 0; i < line_n && at < QP_SLOT_COUNT; i++) {
+	for (int i = 0; i < line_n && at < grid; i++) {
 		slots[at++] = line[i];
 	}
 	while (at < QP_SLOT_COUNT) {
 		slots[at++] = QP_BTN_NONE;
 	}
 
-	// Whatever did not fit. Only reachable from an older file: from version 3
-	// the list is the grid and cannot be longer than it.
-	for (int i = QP_SLOT_COUNT; i < line_n; i++) {
-		hidden[hidden_n++] = line[i];
+	// Whatever did not fit, which only the buttons appended above can be.
+	for (int i = grid; i < line_n; i++) {
+		if (line[i] < QP_BTN_COUNT) {
+			hidden[hidden_n++] = line[i];
+		}
 	}
 }
 
-static void order_save(void) {
-	char text[(QP_BTN_COUNT + QP_SLOT_COUNT) * 12];
+// Writes `count` names from `items` under `key`, "-" for an empty place.
+static void write_list(const char *key, const uint8_t *items, int count) {
+	char text[QP_LIST_SPLIT * 20];
 	size_t used = 0;
 
 	text[0] = '\0';
-	for (int i = 0; i < QP_SLOT_COUNT; i++) {
-		const char *name = slots[i] < QP_BTN_COUNT ? button_key[slots[i]] : QP_SLOT_EMPTY_KEY;
+	for (int i = 0; i < count; i++) {
+		const char *name = items[i] < QP_BTN_COUNT ? button_key[items[i]] : QP_SLOT_EMPTY_KEY;
 		int wrote = snprintf(text + used, sizeof(text) - used, "%s%s", i ? "," : "", name);
 		if (wrote <= 0 || (size_t)wrote >= sizeof(text) - used) {
 			break;
 		}
 		used += (size_t)wrote;
 	}
-	config_set("quickpanel", "order", text);
+	config_set("quickpanel", key, text);
+}
 
-	used = 0;
-	text[0] = '\0';
-	for (int i = 0; i < hidden_n; i++) {
-		int wrote = snprintf(text + used, sizeof(text) - used, "%s%s", i ? "," : "", button_key[hidden[i]]);
-		if (wrote <= 0 || (size_t)wrote >= sizeof(text) - used) {
-			break;
-		}
-		used += (size_t)wrote;
+static void order_save(void) {
+	// Up to the last button: the empty places after it are what a short list
+	// reads back as anyway.
+	int last = QP_SLOT_COUNT;
+	while (last > 0 && slots[last - 1] >= QP_BTN_COUNT) {
+		last--;
 	}
-	config_set("quickpanel", "hidden", text);
+	int head = last < QP_LIST_SPLIT ? last : QP_LIST_SPLIT;
+	write_list("order", slots, head);
+	write_list("order_more", slots + head, last - head);
+
+	head = hidden_n < QP_LIST_SPLIT ? hidden_n : QP_LIST_SPLIT;
+	write_list("hidden", hidden, head);
+	write_list("hidden_more", hidden + head, hidden_n - head);
 
 	config_set_int("quickpanel", "layout", QP_LAYOUT_VERSION);
 	config_save();
@@ -993,15 +1163,19 @@ static lv_obj_t *button_widget(quickpanel_button_t which) {
 		return sleep_podcast_btn;
 	case QP_BTN_WIFI_TRANSFER:
 		return wifi_transfer_btn;
+	case QP_BTN_GAPLESS:
+		return gapless_btn;
 	default:
 		return NULL;
 	}
 }
 
-// Puts the widgets in the grid's order. The row is a wrapping flex, so its
-// child index is the position on screen and nothing has to be rebuilt; a hidden
-// child is skipped by the flex layout, so an empty place in the grid is simply
-// a button the panel does not draw, and the row closes up behind it.
+// Puts the widgets in the grid's order: the first QP_SLOT_VISIBLE into the
+// card's own rows, the rest into the block the stretch uncovers. Both are
+// wrapping flexes, so a child's index is its position on screen and nothing
+// has to be rebuilt; a hidden child is skipped by the flex layout, so an empty
+// place in the grid is simply a button the panel does not draw, and the row
+// closes up behind it.
 static void order_apply(void) {
 	int at = 0;
 	for (int i = 0; i < QP_SLOT_COUNT; i++) {
@@ -1009,17 +1183,42 @@ static void order_apply(void) {
 			continue;
 		}
 		lv_obj_t *btn = button_widget((quickpanel_button_t)slots[i]);
-		if (btn) {
-			lv_obj_remove_flag(btn, LV_OBJ_FLAG_HIDDEN);
-			lv_obj_move_to_index(btn, at++);
+		if (!btn) {
+			continue;
 		}
+		bool first = at < QP_SLOT_VISIBLE;
+		lv_obj_t *home = first ? quick_row : extra_row;
+		if (lv_obj_get_parent(btn) != home) {
+			lv_obj_set_parent(btn, home);
+		}
+		lv_obj_set_hidden(btn, false);
+		lv_obj_move_to_index(btn, first ? at : at - QP_SLOT_VISIBLE);
+		at++;
 	}
 	for (int i = 0; i < hidden_n; i++) {
 		lv_obj_t *btn = button_widget((quickpanel_button_t)hidden[i]);
 		if (btn) {
-			lv_obj_add_flag(btn, LV_OBJ_FLAG_HIDDEN);
+			lv_obj_set_hidden(btn, true);
 		}
 	}
+
+	// How far the card stretches: a line and the gap above it for each line of
+	// the second block, the same pitch as the lines above.
+	int extra = at > QP_SLOT_VISIBLE ? at - QP_SLOT_VISIBLE : 0;
+	int lines = (extra + QP_BUTTONS_PER_LINE - 1) / QP_BUTTONS_PER_LINE;
+	expand_full = lines * (CIRCLE_BUTTON_SIZE + CIRCLE_BUTTON_GAP);
+
+	// With a handle to show the card takes HANDLE_ROOM from the now-playing
+	// card, which has height to spare under its transport; without one both
+	// stay as they always were.
+	if (controls_card) {
+		int room = expand_full ? HANDLE_ROOM : 0;
+		card_h_base = card_h_rest + room;
+		lv_obj_set_y(np_card, card_top + card_h_base + CARD_GAP);
+		lv_obj_set_height(np_card, card_h_rest - room);
+		lv_obj_set_hidden(expand_handle, expand_full == 0);
+	}
+	expand_to(0, false);
 }
 
 int quickpanel_hidden_count(void) {
@@ -1178,6 +1377,8 @@ const lv_image_dsc_t *quickpanel_button_icon(quickpanel_button_t button) {
 		return &icon_sleep_podcast_quick;
 	case QP_BTN_WIFI_TRANSFER:
 		return &icon_wifi_transfer_quick;
+	case QP_BTN_GAPLESS:
+		return &icon_gapless_on_quick;
 	default:
 		return &icon_wifi;
 	}
@@ -1187,10 +1388,26 @@ const lv_image_dsc_t *quickpanel_button_icon(quickpanel_button_t button) {
 // construction
 // ---------------------------------------------------------------------------
 
+// First in line for a circle's tap and hold: a press that has become a drag of
+// the sheet or the card ends there, and the circle's own handlers never hear of
+// it. The finger stays on a circle while the sheet carries both, and a circle
+// keeps its press while the finger leaves it, so either would otherwise end the
+// drag by toggling or by opening a page.
+static void circle_guard_cb(lv_event_t *e) {
+	if (press_dragged) {
+		lv_event_stop_processing(e);
+	}
+}
+
 // One round quick control: a circle in the pressed-surface colour with the
-// glyph centred on it. Callers attach their own handlers.
+// glyph centred on it. Callers attach their own handlers. Presses bubble on to
+// the sheet, so a drag that starts on a circle moves the sheet or the card like
+// a drag anywhere else.
 static lv_obj_t *make_circle_button(lv_obj_t *parent, const lv_image_dsc_t *glyph) {
 	lv_obj_t *btn = lv_btn_create(parent);
+	lv_obj_set_event_bubble(btn, true);
+	lv_obj_add_event_cb(btn, circle_guard_cb, LV_EVENT_CLICKED, NULL);
+	lv_obj_add_event_cb(btn, circle_guard_cb, LV_EVENT_LONG_PRESSED, NULL);
 	lv_obj_set_size(btn, CIRCLE_BUTTON_SIZE, CIRCLE_BUTTON_SIZE);
 	lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
 	lv_obj_add_style(btn, &theme_style_switch, 0); // neutral circle that follows the theme
@@ -1259,6 +1476,29 @@ static void refresh_audio_buttons(void) {
 	}
 	circle_button_set_on(gain_btn, high);
 	circle_button_set_on(lineout_btn, lineout_is_active());
+
+	// The drawing changes with the state as well as the fill: the two halves
+	// closed up while on, apart while off.
+	bool gapless = musicsettings_gapless_enabled();
+	if (gapless_btn) {
+		lv_obj_t *icon = lv_obj_get_child(gapless_btn, 0);
+		if (icon) {
+			lv_image_set_src(icon, gapless ? &icon_gapless_on_quick : &icon_gapless_off_quick);
+		}
+	}
+	circle_button_set_on(gapless_btn, gapless);
+}
+
+// After a button has switched something: the circles repaint, and the page
+// under the sheet is told, since it may be the very page that setting lives on
+// and must not go on showing the old state. Pages that carry one of these
+// settings answer LV_EVENT_REFRESH by reading it again; the rest ignore it.
+static void toggled(void) {
+	refresh_audio_buttons();
+	lv_obj_t *page = lv_screen_active();
+	if (page) {
+		lv_obj_send_event(page, LV_EVENT_REFRESH, NULL);
+	}
 }
 
 // Line out: the jack driven for an amplifier, at the fixed level the stock
@@ -1314,7 +1554,7 @@ static void wifi_clicked_cb(lv_event_t *e) {
 		return; // no radio to switch; the settings page explains why
 	}
 	wifi_set_enabled(!wifi_get_enabled());
-	refresh_audio_buttons();
+	toggled();
 	topbar_refresh_radios();
 }
 
@@ -1328,7 +1568,7 @@ static void bt_clicked_cb(lv_event_t *e) {
 		return;
 	}
 	bluetooth_set_enabled(!bluetooth_get_enabled());
-	refresh_audio_buttons();
+	toggled();
 	topbar_refresh_radios();
 }
 
@@ -1380,7 +1620,7 @@ static void airplay_clicked_cb(lv_event_t *e) {
 	}
 
 	airplay_set_enabled(want);
-	refresh_audio_buttons();
+	toggled();
 }
 
 static void mseb_clicked_cb(lv_event_t *e) {
@@ -1390,7 +1630,7 @@ static void mseb_clicked_cb(lv_event_t *e) {
 		return; // the long press that opened the page must not also toggle
 	}
 	musicsettings_set_mseb_enabled(!mseb_get_enabled());
-	refresh_audio_buttons();
+	toggled();
 }
 
 static void eq_clicked_cb(lv_event_t *e) {
@@ -1400,7 +1640,7 @@ static void eq_clicked_cb(lv_event_t *e) {
 		return;
 	}
 	musicsettings_set_eq_enabled(!eq_get_enabled());
-	refresh_audio_buttons();
+	toggled();
 }
 
 static void fade_clicked_cb(lv_event_t *e) {
@@ -1410,7 +1650,7 @@ static void fade_clicked_cb(lv_event_t *e) {
 		return;
 	}
 	musicsettings_set_fade_enabled(!musicsettings_fade_enabled());
-	refresh_audio_buttons();
+	toggled();
 }
 
 // SonixLink, same contract as the radios: a tap switches the server on or off,
@@ -1432,7 +1672,7 @@ static void sonixlink_clicked_cb(lv_event_t *e) {
 	}
 
 	sonixlink_set_enabled(want);
-	refresh_audio_buttons();
+	toggled();
 }
 
 // ---------------------------------------------------------------------------
@@ -1467,7 +1707,7 @@ static void sleep_timer_clicked(sleeptimer_kind_t kind) {
 		gui_notify_popup("quickpanel_sleep_no_length");
 		return;
 	}
-	refresh_audio_buttons();
+	toggled();
 }
 
 static void sleep_music_clicked_cb(lv_event_t *e) {
@@ -1483,6 +1723,20 @@ static void sleep_audiobook_clicked_cb(lv_event_t *e) {
 static void sleep_podcast_clicked_cb(lv_event_t *e) {
 	(void)e;
 	sleep_timer_clicked(SLEEPTIMER_PODCAST);
+}
+
+static void open_page(lv_obj_t *screen);
+
+// A hold opens the page that sets the length: the playback options for music,
+// the audiobook options, the podcast settings. Looked up at the press rather
+// than when the buttons are made, since not every one of those pages exists
+// by then.
+static void sleep_page_cb(lv_event_t *e) {
+	sleeptimer_kind_t kind = (sleeptimer_kind_t)(intptr_t)lv_event_get_user_data(e);
+	lv_obj_t *screen = kind == SLEEPTIMER_MUSIC		 ? musicsettings_playback_screen()
+					   : kind == SLEEPTIMER_AUDIOBOOK ? audiobooksettings_screen
+													  : podcastpage_settings_screen();
+	open_page(screen);
 }
 
 // DLNA, the third of the same family: a phone pushes music at the player over
@@ -1507,7 +1761,7 @@ static void dlna_clicked_cb(lv_event_t *e) {
 	}
 
 	dlna_set_enabled(want);
-	refresh_audio_buttons();
+	toggled();
 }
 
 // Wi-Fi transfer. The server lives only as long as its page is open (see
@@ -1523,7 +1777,7 @@ static void wifi_transfer_clicked_cb(lv_event_t *e) {
 
 	if (wifitransfer_get_enabled()) {
 		wifitransfer_page_stop();
-		refresh_audio_buttons();
+		toggled();
 		return;
 	}
 	if (!wifitransfer_available()) {
@@ -1554,7 +1808,24 @@ static void peq_clicked_cb(lv_event_t *e) {
 		return;
 	}
 	peq_set_enabled(!peq_get_enabled());
-	refresh_audio_buttons();
+	toggled();
+}
+
+// Gapless, the switch on the playback options page: a tap flips it, a hold
+// opens that page. Looked up at the press, like the sleep timer's page.
+static void gapless_clicked_cb(lv_event_t *e) {
+	(void)e;
+	if (long_press_consumed) {
+		long_press_consumed = false;
+		return;
+	}
+	musicsettings_set_gapless_enabled(!musicsettings_gapless_enabled());
+	toggled();
+}
+
+static void gapless_page_cb(lv_event_t *e) {
+	(void)e;
+	open_page(musicsettings_playback_screen());
 }
 
 static void gain_clicked_cb(lv_event_t *e) {
@@ -1564,13 +1835,12 @@ static void gain_clicked_cb(lv_event_t *e) {
 		return;
 	}
 	musicsettings_set_high_gain(!musicsettings_high_gain());
-	refresh_audio_buttons();
+	toggled();
 }
 
-static void open_page_cb(lv_event_t *e) {
+static void open_page(lv_obj_t *screen) {
 	long_press_consumed = true;
 	quickpanel_close();
-	lv_obj_t *screen = lv_event_get_user_data(e);
 	if (!screen) {
 		return;
 	}
@@ -1593,6 +1863,8 @@ static void open_page_cb(lv_event_t *e) {
 	}
 }
 
+static void open_page_cb(lv_event_t *e) { open_page(lv_event_get_user_data(e)); }
+
 // A bare glyph button for the transport row.
 static lv_obj_t *make_flat_button(lv_obj_t *parent, int size, lv_event_cb_t cb) {
 	lv_obj_t *btn = lv_btn_create(parent);
@@ -1610,7 +1882,7 @@ static lv_obj_t *make_flat_button(lv_obj_t *parent, int size, lv_event_cb_t cb) 
 // together they fill the screen instead of floating in the middle of it.
 static lv_obj_t *make_card(lv_obj_t *parent, int width, int height, int top_y) {
 	lv_obj_t *card = lv_obj_create(parent);
-	lv_obj_add_flag(card, LV_OBJ_FLAG_IGNORE_LAYOUT);
+	lv_obj_set_ignore_layout(card, true);
 	lv_obj_set_size(card, width, height);
 	lv_obj_align(card, LV_ALIGN_TOP_MID, 0, top_y);
 	lv_obj_add_style(card, &theme_style_card, 0);
@@ -1618,10 +1890,10 @@ static lv_obj_t *make_card(lv_obj_t *parent, int width, int height, int top_y) {
 	lv_obj_set_style_border_width(card, 0, 0);
 	lv_obj_set_style_shadow_width(card, 0, 0);
 	lv_obj_set_style_pad_all(card, CARD_PADDING, 0);
-	lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_set_scrollable(card, false);
 	// Presses bubble to the sheet, whose drag handler carries the panel back out
 	// from anywhere on it.
-	lv_obj_add_flag(card, LV_OBJ_FLAG_EVENT_BUBBLE);
+	lv_obj_set_event_bubble(card, true);
 	return card;
 }
 
@@ -1635,8 +1907,8 @@ void quickpanel_init(gui_config_t *cfg) {
 	lv_obj_set_style_border_width(veil, 0, 0);
 	lv_obj_set_style_radius(veil, 0, 0);
 	lv_obj_set_style_pad_all(veil, 0, 0);
-	lv_obj_remove_flag(veil, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_add_flag(veil, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_scrollable(veil, false);
+	lv_obj_set_hidden(veil, true);
 	lv_obj_add_event_cb(veil, veil_clicked_cb, LV_EVENT_CLICKED, NULL);
 
 	// The sheet fills the whole screen, iOS-control-centre style.
@@ -1650,9 +1922,9 @@ void quickpanel_init(gui_config_t *cfg) {
 	lv_obj_set_style_pad_top(panel, PANEL_PAD_TOP(cfg), 0);
 	lv_obj_set_style_pad_bottom(panel, PANEL_PAD_BOTTOM, 0);
 	lv_obj_set_style_pad_gap(panel, 14, 0);
-	lv_obj_remove_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_remove_flag(panel, LV_OBJ_FLAG_EVENT_BUBBLE);
-	lv_obj_add_flag(panel, LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_set_scrollable(panel, false);
+	lv_obj_set_event_bubble(panel, false);
+	lv_obj_set_clickable(panel, true);
 	lv_obj_add_event_cb(panel, panel_drag_cb, LV_EVENT_PRESSED, NULL);
 	lv_obj_add_event_cb(panel, panel_drag_cb, LV_EVENT_PRESSING, NULL);
 	lv_obj_add_event_cb(panel, panel_drag_cb, LV_EVENT_RELEASED, NULL);
@@ -1674,25 +1946,30 @@ void quickpanel_init(gui_config_t *cfg) {
 	}
 
 	// --- First card: the quick controls. ---
-	lv_obj_t *controls_card = make_card(panel, card_w, card_h, top_inset);
+	controls_card = make_card(panel, card_w, card_h, top_inset);
+	card_h_rest = card_h;
+	card_h_base = card_h;
+	card_top = top_inset;
 	lv_obj_set_flex_flow(controls_card, LV_FLEX_FLOW_COLUMN);
-	// Brightness along the bottom; the buttons take the height above it and
+	// Brightness under the buttons; the buttons take the height above it and
 	// their rows are centred in it, so a single row of four sits midway between
-	// the top of the card and the slider.
-	lv_obj_set_flex_align(controls_card, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-	lv_obj_set_style_pad_gap(controls_card, 12, 0);
+	// the top of the card and the slider. A fixed height and not a share of the
+	// card, so the slider stays where it is while the card stretches.
+	lv_obj_set_flex_align(controls_card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	lv_obj_set_style_pad_gap(controls_card, CARD_ROW_GAP, 0);
+	int row_h = card_h - 2 * CARD_PADDING - BRIGHT_ROW_H - CARD_ROW_GAP;
 
 	lv_obj_t *row = lv_obj_create(controls_card);
-	// Wraps to a second line past four buttons. Grows into the free height of
-	// the card; the third flex argument below centres the lines inside it.
-	lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
-	lv_obj_set_flex_grow(row, 1);
+	quick_row = row;
+	// Wraps to a second line past four buttons; the third flex argument below
+	// centres the lines inside the height.
+	lv_obj_set_size(row, lv_pct(100), row_h);
 	lv_obj_set_style_bg_opa(row, 0, 0);
 	lv_obj_set_style_border_width(row, 0, 0);
 	lv_obj_set_style_pad_all(row, 0, 0);
 	lv_obj_set_style_pad_gap(row, CIRCLE_BUTTON_GAP, 0);
-	lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_add_flag(row, LV_OBJ_FLAG_EVENT_BUBBLE);
+	lv_obj_set_scrollable(row, false);
+	lv_obj_set_event_bubble(row, true);
 	lv_obj_set_style_pad_row(row, CIRCLE_BUTTON_GAP, 0);
 	lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW_WRAP);
 	lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -1756,30 +2033,33 @@ void quickpanel_init(gui_config_t *cfg) {
 	lv_obj_add_event_cb(dlna_btn, dlna_clicked_cb, LV_EVENT_CLICKED, NULL);
 	lv_obj_add_event_cb(dlna_btn, open_page_cb, LV_EVENT_LONG_PRESSED, dlna_screen);
 
-	// No page on a long press for these three: the length is chosen on the page
-	// that belongs to the kind of listening -- playback options, the audiobook
-	// options, the podcast options -- and there is no one page to open.
+	// Each of the three opens, on a long press, the page of its own kind of
+	// listening, where its length is chosen.
 	sleep_music_btn = make_circle_button(row, &icon_sleep_music_quick);
 	lv_obj_add_event_cb(sleep_music_btn, sleep_music_clicked_cb, LV_EVENT_CLICKED, NULL);
+	lv_obj_add_event_cb(sleep_music_btn, sleep_page_cb, LV_EVENT_LONG_PRESSED, (void *)(intptr_t)SLEEPTIMER_MUSIC);
 
 	sleep_audiobook_btn = make_circle_button(row, &icon_sleep_audiobook_quick);
 	lv_obj_add_event_cb(sleep_audiobook_btn, sleep_audiobook_clicked_cb, LV_EVENT_CLICKED, NULL);
+	lv_obj_add_event_cb(sleep_audiobook_btn, sleep_page_cb, LV_EVENT_LONG_PRESSED,
+						(void *)(intptr_t)SLEEPTIMER_AUDIOBOOK);
 
 	sleep_podcast_btn = make_circle_button(row, &icon_sleep_podcast_quick);
 	lv_obj_add_event_cb(sleep_podcast_btn, sleep_podcast_clicked_cb, LV_EVENT_CLICKED, NULL);
+	lv_obj_add_event_cb(sleep_podcast_btn, sleep_page_cb, LV_EVENT_LONG_PRESSED,
+						(void *)(intptr_t)SLEEPTIMER_PODCAST);
 
 	// A tap opens the page with the server starting; a hold opens it as it is.
 	wifi_transfer_btn = make_circle_button(row, &icon_wifi_transfer_quick);
 	lv_obj_add_event_cb(wifi_transfer_btn, wifi_transfer_clicked_cb, LV_EVENT_CLICKED, NULL);
 	lv_obj_add_event_cb(wifi_transfer_btn, open_page_cb, LV_EVENT_LONG_PRESSED, wifitransfer_screen);
 
-	// Built in the order above, then arranged into the user's -- see
-	// Settings > More > Control centre.
-	order_load();
-	order_apply();
+	gapless_btn = make_circle_button(row, &icon_gapless_off_quick);
+	lv_obj_add_event_cb(gapless_btn, gapless_clicked_cb, LV_EVENT_CLICKED, NULL);
+	lv_obj_add_event_cb(gapless_btn, gapless_page_cb, LV_EVENT_LONG_PRESSED, NULL);
 
-	lv_obj_t *bright_row = lv_obj_create(controls_card);
-	lv_obj_set_size(bright_row, lv_pct(100), 44);
+	bright_row = lv_obj_create(controls_card);
+	lv_obj_set_size(bright_row, lv_pct(100), BRIGHT_ROW_H);
 	lv_obj_set_style_bg_opa(bright_row, 0, 0);
 	lv_obj_set_style_border_width(bright_row, 0, 0);
 	lv_obj_set_style_pad_all(bright_row, 0, 0);
@@ -1789,8 +2069,8 @@ void quickpanel_init(gui_config_t *cfg) {
 	// right edge gives it room.
 	lv_obj_set_style_pad_right(bright_row, 13, 0);
 	lv_obj_set_style_pad_gap(bright_row, 18, 0);
-	lv_obj_remove_flag(bright_row, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_add_flag(bright_row, LV_OBJ_FLAG_EVENT_BUBBLE);
+	lv_obj_set_scrollable(bright_row, false);
+	lv_obj_set_event_bubble(bright_row, true);
 	lv_obj_set_flex_flow(bright_row, LV_FLEX_FLOW_ROW);
 	lv_obj_set_flex_align(bright_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
@@ -1819,8 +2099,64 @@ void quickpanel_init(gui_config_t *cfg) {
 	lv_obj_add_event_cb(brightness_slider, brightness_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
 	lv_obj_add_event_cb(brightness_slider, brightness_released_cb, LV_EVENT_RELEASED, NULL);
 
+	// The buttons past the eighth. A window outside the flex, starting where the
+	// first two lines end, opens as tall as the stretch while the slider moves
+	// down by as much; the buttons sit in it one gap down, so they read as
+	// further lines of the grid above. The window clips them, so the stretch is
+	// what uncovers them.
+	int first_lines = QP_SLOT_VISIBLE / QP_BUTTONS_PER_LINE;
+	int first_h = first_lines * CIRCLE_BUTTON_SIZE + (first_lines - 1) * CIRCLE_BUTTON_GAP;
+	extra_clip = lv_obj_create(controls_card);
+	lv_obj_remove_style_all(extra_clip);
+	lv_obj_set_ignore_layout(extra_clip, true);
+	lv_obj_set_size(extra_clip, lv_pct(100), 0);
+	lv_obj_set_pos(extra_clip, 0, (row_h + first_h) / 2); // the grid's lines are centred in the row
+	lv_obj_set_scrollable(extra_clip, false);
+	lv_obj_set_event_bubble(extra_clip, true);
+	lv_obj_set_hidden(extra_clip, true);
+
+	extra_row = lv_obj_create(extra_clip);
+	lv_obj_set_size(extra_row, lv_pct(100), LV_SIZE_CONTENT);
+	lv_obj_set_pos(extra_row, 0, CIRCLE_BUTTON_GAP);
+	lv_obj_set_style_bg_opa(extra_row, 0, 0);
+	lv_obj_set_style_border_width(extra_row, 0, 0);
+	lv_obj_set_style_pad_all(extra_row, 0, 0);
+	lv_obj_set_style_pad_gap(extra_row, CIRCLE_BUTTON_GAP, 0);
+	lv_obj_set_scrollable(extra_row, false);
+	lv_obj_set_event_bubble(extra_row, true);
+	lv_obj_set_flex_flow(extra_row, LV_FLEX_FLOW_ROW_WRAP);
+	lv_obj_set_flex_align(extra_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+	// The handle: a short line in the band under the slider -- the room the
+	// card gains for it and the card's bottom padding -- which travels down
+	// with the edge as the card stretches. The line is what is seen; the strip
+	// round it, the whole band high, is what a tap finds, and a tap folds or
+	// stretches the card. Presses bubble on to the sheet, so a drag starting on
+	// it is the same drag as anywhere else.
+	expand_handle = lv_obj_create(controls_card);
+	lv_obj_set_ignore_layout(expand_handle, true);
+	lv_obj_set_size(expand_handle, 160, HANDLE_ROOM + CARD_PADDING);
+	lv_obj_align(expand_handle, LV_ALIGN_BOTTOM_MID, 0, CARD_PADDING);
+	lv_obj_set_style_bg_opa(expand_handle, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_border_width(expand_handle, 0, 0);
+	lv_obj_set_style_shadow_width(expand_handle, 0, 0);
+	lv_obj_set_style_pad_all(expand_handle, 0, 0);
+	lv_obj_set_scrollable(expand_handle, false);
+	lv_obj_set_event_bubble(expand_handle, true);
+	lv_obj_add_event_cb(expand_handle, expand_handle_clicked_cb, LV_EVENT_CLICKED, NULL);
+
+	expand_pill = lv_obj_create(expand_handle);
+	lv_obj_set_size(expand_pill, 36, 5);
+	lv_obj_center(expand_pill);
+	lv_obj_set_style_radius(expand_pill, LV_RADIUS_CIRCLE, 0);
+	lv_obj_set_style_bg_color(expand_pill, theme()->text_primary, 0);
+	lv_obj_set_style_bg_opa(expand_pill, LV_OPA_40, 0);
+	lv_obj_set_style_border_width(expand_pill, 0, 0);
+	lv_obj_set_style_shadow_width(expand_pill, 0, 0);
+	lv_obj_set_clickable(expand_pill, false);
+
 	// --- Second card: what is playing, and its transport. ---
-	lv_obj_t *np_card = make_card(panel, card_w, card_h, top_inset + card_h + CARD_GAP);
+	np_card = make_card(panel, card_w, card_h, top_inset + card_h + CARD_GAP);
 	lv_obj_set_flex_flow(np_card, LV_FLEX_FLOW_COLUMN);
 	lv_obj_set_flex_align(np_card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 	lv_obj_set_style_pad_gap(np_card, 6, 0);
@@ -1851,8 +2187,8 @@ void quickpanel_init(gui_config_t *cfg) {
 	lv_obj_set_style_bg_opa(transport, 0, 0);
 	lv_obj_set_style_border_width(transport, 0, 0);
 	lv_obj_set_style_pad_all(transport, 0, 0);
-	lv_obj_remove_flag(transport, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_add_flag(transport, LV_OBJ_FLAG_EVENT_BUBBLE);
+	lv_obj_set_scrollable(transport, false);
+	lv_obj_set_event_bubble(transport, true);
 	lv_obj_set_flex_flow(transport, LV_FLEX_FLOW_ROW);
 	lv_obj_set_flex_align(transport, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 	lv_obj_set_style_pad_column(transport, 4, 0);
@@ -1862,7 +2198,7 @@ void quickpanel_init(gui_config_t *cfg) {
 	// between them: the player's arrangement.
 	lv_obj_t *repeat_btn = make_flat_button(transport, 56, repeat_cb);
 	np_repeat_btn = repeat_btn;
-	lv_obj_add_flag(repeat_btn, LV_OBJ_FLAG_IGNORE_LAYOUT);
+	lv_obj_set_ignore_layout(repeat_btn, true);
 	lv_obj_align(repeat_btn, LV_ALIGN_LEFT_MID, 0, 0);
 	np_repeat_icon = lv_image_create(repeat_btn);
 	lv_obj_center(np_repeat_icon);
@@ -1903,7 +2239,7 @@ void quickpanel_init(gui_config_t *cfg) {
 
 	lv_obj_t *star_btn = make_flat_button(transport, 56, star_cb);
 	np_star_btn = star_btn;
-	lv_obj_add_flag(star_btn, LV_OBJ_FLAG_IGNORE_LAYOUT);
+	lv_obj_set_ignore_layout(star_btn, true);
 	lv_obj_align(star_btn, LV_ALIGN_RIGHT_MID, 0, 0);
 	np_star_icon = lv_image_create(star_btn);
 	lv_obj_center(np_star_icon);
@@ -1913,7 +2249,7 @@ void quickpanel_init(gui_config_t *cfg) {
 	// is what actually closes the panel. The line is not clickable: a finger
 	// landing on it talks to the surface underneath, where the gesture lives.
 	lv_obj_t *close_btn = lv_obj_create(panel);
-	lv_obj_add_flag(close_btn, LV_OBJ_FLAG_IGNORE_LAYOUT);
+	lv_obj_set_ignore_layout(close_btn, true);
 	lv_obj_set_size(close_btn, 140, HINT_STRIP_H - 8);
 	// Flush with the bottom of the sheet's content box, which centres the line in
 	// the band between the last card and the screen edge: the band is
@@ -1925,14 +2261,24 @@ void quickpanel_init(gui_config_t *cfg) {
 	lv_obj_set_style_shadow_width(close_btn, 0, 0);
 	lv_obj_set_style_border_width(close_btn, 0, 0);
 	lv_obj_set_style_pad_all(close_btn, 0, 0);
-	lv_obj_remove_flag(close_btn, LV_OBJ_FLAG_CLICKABLE);
-	lv_obj_remove_flag(close_btn, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_set_clickable(close_btn, false);
+	lv_obj_set_scrollable(close_btn, false);
 
 	lv_obj_t *hint = lv_image_create(close_btn);
 	lv_image_set_src(hint, &icon_control_center_line);
 	lv_obj_add_style(hint, &theme_style_icon, 0);
 	lv_obj_set_style_image_opa(hint, LV_OPA_60, 0);
 	lv_obj_center(hint);
+
+	// The controls card in front of the now-playing one, which it covers when
+	// stretched.
+	lv_obj_move_to_index(controls_card, lv_obj_get_index(np_card));
+
+	// Built in the order above, then arranged into the user's -- see
+	// Settings > More > Control centre. Last, once both rows and the handle
+	// exist to arrange.
+	order_load();
+	order_apply();
 
 	poll_timer = lv_timer_create(poll_cb, PANEL_POLL_MS, NULL);
 	lv_timer_pause(poll_timer);

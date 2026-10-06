@@ -2,6 +2,7 @@
 #define RADIO_H
 
 #include <stdbool.h>
+#include <stddef.h>
 
 // Internet radio, on top of the radio-browser.info directory.
 //
@@ -123,6 +124,10 @@ int radio_last_raw_count(void);
 bool radio_store_open(const char *sd_root);
 void radio_store_close(void);
 
+// Closes and reopens the store when radio.db was deleted or replaced under the
+// open handle.
+void radio_store_reopen_if_replaced(void);
+
 int radio_fav_count(void);
 bool radio_fav_get(int index, radio_station_t *out);
 bool radio_fav_contains(const char *uuid);
@@ -145,7 +150,9 @@ bool radio_recent_get(int index, radio_station_t *out);
 //
 // One per line, "name, url". The comma is the first one on the line, so a name
 // with a comma in it works as long as the comma is not the last thing before
-// the address; blank lines and lines starting with # are skipped.
+// the address; blank lines and lines starting with # are skipped. A line that
+// is a name in square brackets, "[ROCK]", is a heading: the stations under it,
+// down to the next one, are shown as a group of that name.
 //
 // A plain file and not the database, because that is what it is for: a list
 // somebody types on a computer and drops on the card, with no directory in the
@@ -159,6 +166,12 @@ void radio_custom_reload(void);
 
 int radio_custom_count(void);
 bool radio_custom_get(int index, radio_station_t *out);
+
+// The heading a station opens, the first one under a "[...]" line: true, with
+// the heading's text in `out`. False for every other station. The headings do
+// not count as stations: indices, previous and next run over the stations
+// alone.
+bool radio_custom_heading(int index, char *out, size_t out_size);
 
 // Whether there is a radio.txt at all, for a page that has to tell an empty
 // list from a missing file.

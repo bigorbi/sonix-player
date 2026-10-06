@@ -49,7 +49,7 @@ static void refresh(void) {
 
 	lv_obj_set_style_text_color(status_label, status_normal_color, 0);
 
-	lv_obj_add_flag(title_label, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(title_label, true);
 
 	if (st.error[0]) {
 		lv_label_set_text(device_label, st.device);
@@ -93,7 +93,7 @@ static void refresh(void) {
 	bt_track_t track;
 	if (st.streaming && bluetooth_receiver_track(&track) && track.title[0]) {
 		lv_label_set_text(title_label, track.title);
-		lv_obj_remove_flag(title_label, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_hidden(title_label, false);
 
 		// Artist and album on one line, with whichever of them there is.
 		char line[sizeof(track.artist) + sizeof(track.album) + 8];
@@ -106,7 +106,7 @@ static void refresh(void) {
 		return;
 	}
 
-	lv_obj_add_flag(title_label, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(title_label, true);
 	lv_label_set_text(status_label, st.streaming ? tr("btreceiver_playing") : tr("btreceiver_waiting"));
 }
 
@@ -250,6 +250,9 @@ static bool back_guard(void) {
 
 static void loaded_cb(lv_event_t *e) {
 	(void)e;
+	// The A2DP sink exists only while this page is open (bluetooth.h): a phone
+	// connects to it from here on.
+	bluetooth_set_receiver_profile(true);
 	last_serial = (unsigned)-1;
 	// Arriving is the switch: there is nothing else this page does, so a toggle
 	// on it would only repeat what opening it already said.
@@ -265,6 +268,7 @@ static void unloaded_cb(lv_event_t *e) {
 	// the deliberate ones; this catches the rest, so the device is never left
 	// holding a stream nobody can see.
 	btreceiver_stop();
+	bluetooth_set_receiver_profile(false);
 }
 
 void btreceiverpage_init(gui_config_t *cfg) {
@@ -322,7 +326,7 @@ void btreceiverpage_init(gui_config_t *cfg) {
 	lv_obj_set_style_text_font(title_label, &font_ui_24, 0);
 	lv_obj_set_style_margin_top(title_label, 18, 0);
 	lv_label_set_text(title_label, "");
-	lv_obj_add_flag(title_label, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_hidden(title_label, true);
 
 	status_label = lv_label_create(container);
 	lv_obj_set_width(status_label, lv_pct(100));

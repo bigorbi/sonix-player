@@ -175,6 +175,11 @@ static stamp_stream_t stamp_err = {STDERR_FILENO, true};
 // Year and day of the year of the last date line; -1 before the first.
 static int stamp_day = -1;
 
+// Sees every whole line printed, before it is stamped. Set once, at startup.
+static logging_line_tap_t line_tap;
+
+void logging_set_line_tap(logging_line_tap_t tap) { line_tap = tap; }
+
 static void write_all(int fd, const char *data, size_t size);
 
 // ---------------------------------------------------------------------------
@@ -466,6 +471,11 @@ static ssize_t stamp_write(void *cookie, const char *data, size_t size) {
 		size_t len = newline ? (size_t)(newline - start) + 1 : size - done;
 		if (stream->line_start && *start != '\n') {
 			write_stamp(stream->fd);
+			// Only lines that arrive whole, which with line buffering is all
+			// but the rare one longer than the stream's buffer.
+			if (line_tap && newline) {
+				line_tap(start, len - 1);
+			}
 		}
 		emit(stream->fd, start, len);
 		stream->line_start = newline != NULL;
@@ -799,22 +809,44 @@ static void sync_card(void) {
 //
 // Each of those steps can itself hang on a kernel in that state, and in a
 // process whose memory map may be locked a new thread may never start. So the
-// guard thread is made at startup and waits: once told, it gives the orderly
-// way OOPS_DEADLINE_S, then restarts the machine through /proc/sysrq-trigger,
-// which asks nothing of this process or of the card.
+// guard thread is made at startup and waits. It is told the moment the report
+// begins, before anything else is printed or written, and then:
+//
+//   - turns kernel.panic_on_oops on, so that a second oops -- in any thread,
+//     the restart below included -- panics instead of killing one more thread;
+//   - gives the orderly way OOPS_DEADLINE_S;
+//   - restarts the machine through /proc/sysrq-trigger, which asks nothing of
+//     this process or of the card.
+//
+// And kernel.panic is set at startup, when it is 0: a panic restarts the
+// device after KERNEL_PANIC_RESTART_S instead of leaving it frozen.
 // ---------------------------------------------------------------------------
 
 #define OOPS_DEADLINE_S 15
+#define KERNEL_PANIC_RESTART_S "10"
 
 static sem_t oops_go;
 static bool oops_guard_running;
 static bool oops_seen;
+
+// Writes `value` into a /proc file. False when it could not be opened or
+// written.
+static bool proc_write(const char *path, const char *value) {
+	int fd = open(path, O_WRONLY | O_CLOEXEC);
+	if (fd < 0) {
+		return false;
+	}
+	bool ok = write(fd, value, strlen(value)) == (ssize_t)strlen(value);
+	close(fd);
+	return ok;
+}
 
 static void *oops_guard(void *arg) {
 	(void)arg;
 	thread_be_realtime("oops guard", 20);
 	while (sem_wait(&oops_go) != 0) {
 	}
+	proc_write("/proc/sys/kernel/panic_on_oops", "1");
 	sleep(OOPS_DEADLINE_S);
 	int fd = open("/proc/sysrq-trigger", O_WRONLY | O_CLOEXEC);
 	if (fd >= 0) {
@@ -835,6 +867,18 @@ static void oops_guard_start(void) {
 	// The simulator's kernel is the desk's own: nothing here restarts it.
 	return;
 #endif
+	// Left alone when the system already chose a timeout.
+	char current[16] = "";
+	int fd = open("/proc/sys/kernel/panic", O_RDONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		ssize_t got = read(fd, current, sizeof(current) - 1);
+		current[got > 0 ? got : 0] = '\0';
+		close(fd);
+		if (atoi(current) == 0 && proc_write("/proc/sys/kernel/panic", KERNEL_PANIC_RESTART_S)) {
+			fprintf(stderr, "kernel: a kernel panic restarts the device after %s s\n", KERNEL_PANIC_RESTART_S);
+		}
+	}
+
 	if (sem_init(&oops_go, 0, 0) != 0) {
 		return;
 	}
@@ -854,15 +898,22 @@ static bool kernel_died_line(const char *text) {
 	return len > 2 && strcmp(text + len - 2, "]:") == 0 && strstr(text, "[#") != NULL;
 }
 
+// The guard's countdown, started once.
+static void oops_guard_arm(void) {
+	static bool armed;
+	if (oops_guard_running && !armed) {
+		armed = true;
+		sem_post(&oops_go);
+	}
+}
+
 static void restart_after_oops(void) {
 	fprintf(stderr, "kernel: the kernel failed under the player; restarting the device\n");
 #ifdef HOST_BUILD
 	logging_flush();
 	return;
 #endif
-	if (oops_guard_running) {
-		sem_post(&oops_go);
-	}
+	oops_guard_arm();
 	logging_flush();
 	sync_card();
 	sync();
@@ -919,6 +970,9 @@ static bool kmsg_copy(void) {
 		if (!oops_seen && kernel_died_line(text)) {
 			oops_seen = true;
 			died = true;
+			// Before the report is printed: printing and writing it out go
+			// through the same kernel that has just failed.
+			oops_guard_arm();
 		}
 		if (!oops_seen && printed >= KMSG_LINES_PER_CALL) {
 			skipped++;

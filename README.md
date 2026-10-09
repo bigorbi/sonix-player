@@ -14,8 +14,9 @@ into each image.
 | panel | 480x720 | 480x800 |
 | DAC | two Cirrus Logic CS43198 | one Cirrus Logic CS43131 |
 | headphone outputs | 3.5 mm, 4.4 mm balanced | 3.5 mm |
-| DAC controls | digital filters, DRE, NOS | digital filters |
-| touch | Goodix gt9xx, patched for multitouch | Hynitron CST8xx, patched for two fingers |
+| DAC controls | digital filters, DRE, NOS | digital filters, NOS |
+| touch | Goodix gt9xx, open-source driver, five fingers | Hynitron CST8xx, open-source driver, two fingers |
+| kernel | custom 4.4.94, see [hiby-custom-kernel](https://github.com/Jepl4r/hiby-custom-kernel) | the same |
 | double tap to wake | yes | no |
 | buttons | volume on the left flank, playback on the right | all on the right flank, one skip key |
 | firmware image | `r3proii.upt` | `r1.upt` |
@@ -205,6 +206,7 @@ sonix-packer/
 ├── r1_original.upt          the stock firmware of the R1, from HiBy
 ├── sonix_player             the binary from `make target`
 ├── sonix_launch             also from `make target`; optional
+├── kernel/                  xImage-R3PII and xImage-R1; optional
 └── assets/
     ├── R3PII/               the overlay for the R3 Pro II
     └── R1/                  the overlay for the R1
@@ -235,7 +237,7 @@ assets/R3PII/                           (and assets/R1/, the same shape)
 │   │       ├── fonts/               default.otf, bold.otf, then korean, thai and arabic .otf, each with a -bold
 │   │       └── gui/                 some of the .png assets the UI loads at runtime - the rest are inside the binary.
 │   └── share/web/                   icons and images for the Wi-Fi transfer page                        
-└── module_driver/                   the patched touch driver and its load script
+└── module_driver/                   the open-source modules and the changed load scripts
 ```
 
 `system-info.json` has to be there, and its `device-name` has to be the model
@@ -282,6 +284,9 @@ sudo apt install p7zip-full squashfs-tools genisoimage
 sudo dnf install p7zip squashfs-tools genisoimage
 ```
 
+perl as well, which macOS and most Linux systems already have: it reads the
+stock `sa_sound_hbc3000.ko` (see step 5).
+
 ### Build
 
 ```bash
@@ -294,7 +299,10 @@ It runs through without asking anything, once for each model:
 2. deletes `usr/bin/hiby_player` and installs `usr/bin/sonix_player`
 3. renames `hiby_player.sh` to `sonix_player.sh` and rewrites the name inside it
 4. points `etc/init.d/S92_03_start_music_player` at the new launcher script
-5. copies `assets/<model>/` over the rootfs, then installs
+5. for the R3 Pro II, copies the HBC3000's FPGA configuration out of the stock
+   `sa_sound_hbc3000.ko` into `lib/firmware/hbc3000.fw`, where the open module
+   loads it from (it is HiBy's, so it is not in the assets); then copies
+   `assets/<model>/` over the rootfs and installs
    `usr/bin/sonix_launch` and has the launcher script exec it (skipped with a warning
    if it is not there)
 6. deletes the stock interface's own resources - `litegui`, `layout`, `str`,
@@ -305,8 +313,30 @@ It runs through without asking anything, once for each model:
    chain the recovery kernel checks
 9. writes `r3proii.upt` or `r1.upt`
 
-The kernel is carried across untouched, size and md5 copied from the original
-rather than recomputed.
+With `kernel/xImage-R3PII` or `kernel/xImage-R1` present, that kernel replaces
+the stock one: it may not be bigger than the stock kernel, and its size and md5
+go into `ota_update.in`. Without it the stock kernel is carried across
+untouched, size and md5 copied from the original rather than recomputed. The
+kernels in `kernel/` are built from
+[hiby-custom-kernel](https://github.com/Jepl4r/hiby-custom-kernel), and the
+modules in `assets/<model>/module_driver/` are built against them.
+
+Most of those modules are open-source replacements for HiBy's closed ones,
+from the same kit: same file names and parameters, so the stock `.sh` that
+loads each one stays. A module that is not in `module_driver/` is HiBy's own,
+carried across from the stock firmware.
+
+| | R3 Pro II | R1 |
+|---|---|---|
+| sound card | `x1600_hiby_r3proii_sound_card.ko` | `x1600_hiby_r1_sound_card.ko` |
+| DAC | `codec_cs43198_dual.ko` | `codec_cs43131.ko` |
+| panel, touch | `lcd_st7701_sbtc033001.ko`, `gt9xx_touch.ko` (five fingers) | `lcd_lg35583.ko`, `cst8xx_touch.ko` (two fingers) |
+| keys | `keyboard_adc.ko` | `keyboard_adc_multifunc.ko` |
+| LEDs | `leds_sgm31324_add.ko` | `leds_pwm_add.ko` |
+| Type-C | `fusb302b_add.ko` | `tcs1421_add.ko` |
+| board | `gpio_aw95016_add.ko`, `sau.ko`, `sa_sound_hbc3000.ko` (the HBC3000 FPGA; its configuration comes from the stock firmware, see step 5 above) | |
+| on both | `cw2015.ko` (fuel gauge), `soc_efuse.ko`, `soc_adc.ko`, `rmem_manager.ko`, `i2c_gpio_add.ko` (the DAC's I2C bus), `keyboard_gpio_add.ko` (power and track keys), `sa_sound_switch.ko`, `sa_earpods_adc.ko`, `pwm_backlight.ko`, `soc_utils.ko`, `sa_config_module.ko`, `utils.ko` (the helpers the other modules link against), `soc_gpio.ko` (`/dev/gpio`), `sa_hgl_dma.ko` (`/dev/sa_hgl_dma`), `soc_aic.ko` (the I2S controller), `soc_pwm.ko` (the PWM controller), `soc_i2c.ko` (the I2C controllers) | the same |
+| Wi-Fi | `brcmfmac.ko`, `brcmutil.ko` and `bcm_wlbt_power.ko` in place of `cywdhd.ko` | the same |
 
 ### Patches
 
@@ -357,13 +387,14 @@ sonix-player/
 │   ├── assets/
 │   │   ├── R3PII/                   the R3 Pro II overlay
 │   │   │   ├── etc/                 boot logos (480x720), sonix-player.conf, cert.pem, modified S80_bt_init
-│   │   │   ├── module_driver/       patched gt9xx_touch.ko, gt9xx_touch.sh and leds_sgm31324_add.sh with 3 added LED registers
+│   │   │   ├── module_driver/       the open-source modules, gt9xx_touch.ko among them; gt9xx_touch.sh for five fingers and leds_sgm31324_add.sh with 3 added LED registers
 │   │   │   └── usr/                 bluealsa 4.3.1, resources required by Sonix Player
 │   │   └── R1/                      the R1 overlay
 │   │       ├── etc/                 boot logos (480x800), sonix-player.conf, cert.pem, modified S80_bt_init
-│   │       ├── module_driver/       patched cst8xx_touch.ko and cst8xx_touch.sh
+│   │       ├── module_driver/       the open-source modules, cst8xx_touch.ko among them; cst8xx_touch.sh for two fingers
 │   │       └── usr/                 bluealsa 4.3.1, resources required by Sonix Player
 │   │                                
+│   ├── kernel/                      xImage-R3PII and xImage-R1, from hiby-custom-kernel
 │   └── sonix_firmware_packer.sh     
 │
 │
@@ -418,7 +449,7 @@ sonix-player/
 │   │   │
 │   │   └── main.c                   entry point: display, input, and the startup order
 │   │
-│   ├── tools/                       generators, and the multitouch patches for the two touch drivers
+│   ├── tools/                       generators, and the multitouch patches for the stock touch drivers
 │   │
 │   ├── web/                         Wi-Fi transfer page, source of src/system/net/webpage.h
 │   │   ├── icons/                   26 Lucide glyphs, inlined as <symbol>
